@@ -227,7 +227,14 @@ impl StructuringAnnotations {
         annotations.detect_folded_call_conditions(cfg);
 
         if let Some(info) = exception_info {
-            annotations.detect_cleanup_side_blocks(cfg, info);
+            // With unwind edges modeled, `structure()` structures every landing pad
+            // (catch and cleanup) into its own bounded sub-region and marks those
+            // blocks processed, so they stay out of the main body without the
+            // blanket side-block suppression. Only fall back to suppression when
+            // the CFG has no EH edges (e.g. older callers that skip augmentation).
+            if !cfg.has_eh_edges() {
+                annotations.detect_cleanup_side_blocks(cfg, info);
+            }
         }
 
         annotations
@@ -493,6 +500,23 @@ impl StructuredCfg {
             );
         }
 
+        // Reconstruct C++ try/catch from LSDA info here: after call-argument
+        // propagation (so the protected body's calls carry their arguments) but
+        // before `simplify_statements`, whose first step merges adjacent blocks
+        // and would drop the block ids the assembly joins on. The temp-cleanup
+        // passes below recurse into `TryCatch`, so the wrapped try body is still
+        // simplified (and its `__cxa_throw` triple collapsed downstream).
+        if let Some(info) = exception_info {
+            if cfg.has_eh_edges() {
+                body = super::apply_exception_handling(
+                    body,
+                    info,
+                    cfg,
+                    &structurer.landing_pad_bodies,
+                );
+            }
+        }
+
         // Post-process to eliminate temporary register patterns
         if config.is_pass_enabled(OptimizationPass::TempSimplification) {
             body = simplify_statements(body);
@@ -687,6 +711,10 @@ struct Structurer<'a> {
     known_ubsan_targets: HashMap<u64, String>,
     /// Known cold-split helpers that ultimately throw or rethrow a C++ exception.
     known_throw_targets: HashMap<u64, String>,
+    /// Structured bodies of exception landing pads, keyed by landing-pad block id.
+    /// Populated by `structure()` for functions with unwind edges; handler blocks
+    /// are structured as bounded sub-regions and kept out of the main body.
+    landing_pad_bodies: HashMap<BasicBlockId, Vec<StructuredNode>>,
 }
 
 fn is_cmpxchg_flag_instruction(inst: &Instruction) -> bool {
@@ -840,6 +868,7 @@ impl<'a> Structurer<'a> {
             known_noreturn_targets,
             known_ubsan_targets,
             known_throw_targets,
+            landing_pad_bodies: HashMap::new(),
         }
     }
 
@@ -1783,6 +1812,30 @@ impl<'a> Structurer<'a> {
 
     fn structure(&mut self) -> Vec<StructuredNode> {
         let mut result = self.structure_region(self.cfg.entry, None);
+
+        // Structure each exception landing-pad region into its own sub-tree, keyed
+        // by the landing-pad block id, so try/catch recovery can attach it as a
+        // catch body. The main region was structured first, so the try body and
+        // the post-try continuation are already `processed`; structuring from a
+        // landing pad therefore stops at the continuation (with a goto/return),
+        // bounding the handler to its own blocks. Marking those blocks processed
+        // keeps them out of the fallback and the main body.
+        if self.cfg.has_eh_edges() {
+            let mut landing_pads: Vec<_> = self
+                .cfg
+                .block_ids()
+                .filter(|&b| self.cfg.is_landing_pad(b))
+                .collect();
+            landing_pads
+                .sort_by_key(|b| self.cfg.block(*b).map(|blk| blk.start).unwrap_or(0));
+            for lp in landing_pads {
+                if self.processed.contains(&lp) {
+                    continue;
+                }
+                let body = self.structure_region(lp, None);
+                self.landing_pad_bodies.insert(lp, body);
+            }
+        }
 
         // Emit ALL unprocessed blocks as labeled sections, not just multi_pred_blocks.
         // This is crucial for irreducible CFGs where some blocks may not be reachable

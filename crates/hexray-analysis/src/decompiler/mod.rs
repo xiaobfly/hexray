@@ -1378,7 +1378,7 @@ impl Decompiler {
                 .collect();
             StructuredCfg {
                 body: transformed_body,
-                cfg_entry: structured.cfg_entry,
+                ..structured
             }
         } else {
             structured
@@ -1400,7 +1400,7 @@ impl Decompiler {
         }
         let structured = StructuredCfg {
             body: stack_struct_binding::apply_bindings(structured.body, &stack_struct_bindings),
-            cfg_entry: structured.cfg_entry,
+            ..structured
         };
 
         // Step 2b: Run expression-level type propagation
@@ -1451,15 +1451,9 @@ impl Decompiler {
         self.seed_assignment_alias_type_info(&structured.body, &mut merged_types);
         self.seed_cpp_special_type_info(&structured.body, &mut merged_types);
 
-        // Step 3: Apply exception handling if available
-        let structured = if let Some(ref eh_info) = self.exception_info {
-            StructuredCfg {
-                body: apply_exception_handling(structured.body, eh_info),
-                cfg_entry: structured.cfg_entry,
-            }
-        } else {
-            structured
-        };
+        // Step 3: C++ try/catch reconstruction already happened inside
+        // `structure()` (before the block-flattening optimization passes, which
+        // would otherwise drop the block ids/ranges the assembly joins on).
 
         // Step 3a: Recognise the canonical Itanium C++ throw triple
         // (`__cxa_allocate_exception` + value store + `__cxa_throw`)
@@ -1487,7 +1481,28 @@ impl Decompiler {
             };
             StructuredCfg {
                 body: structurer::recover_cxa_throw_pattern(structured.body, &resolve),
-                cfg_entry: structured.cfg_entry,
+                ..structured
+            }
+        };
+
+        // Step 3b: Strip pure EH landing-pad scaffolding (`__cxa_begin_catch` /
+        // `__cxa_end_catch` / `_Unwind_Resume` / …) from recovered catch bodies
+        // and unwrap the redundant type-selector `if`, so the handler reads like
+        // source. Runs here because it needs call-target name resolution.
+        let structured = {
+            let resolve = |target_addr: u64, call_site: u64| -> Option<String> {
+                if let Some(reloc) = self.relocation_table.as_ref() {
+                    if let Some(name) = reloc.get(call_site) {
+                        return Some(name.to_string());
+                    }
+                }
+                self.symbol_table
+                    .as_ref()
+                    .and_then(|st| st.get(target_addr).map(str::to_string))
+            };
+            StructuredCfg {
+                body: strip_exception_scaffolding(structured.body, &resolve),
+                ..structured
             }
         };
 
@@ -1518,7 +1533,7 @@ impl Decompiler {
             (
                 StructuredCfg {
                     body,
-                    cfg_entry: structured.cfg_entry,
+                    ..structured
                 },
                 recovered,
             )
@@ -2632,6 +2647,17 @@ impl Decompiler {
         );
         let ubsan_targets =
             collect_known_ubsan_targets(self.symbol_table.as_ref(), self.relocation_table.as_ref());
+        // When LSDA exception info is available, augment the CFG with unwind edges
+        // (block -> landing pad) so the structurer can recover try/catch shape.
+        // Functions without exception info are untouched (no clone, no edges).
+        let augmented_cfg;
+        let cfg = match self.exception_info.as_ref() {
+            Some(info) => {
+                augmented_cfg = augment_cfg_with_eh_edges(cfg, info);
+                &augmented_cfg
+            }
+            None => cfg,
+        };
         if let Some(ref config) = self.config {
             StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
                 cfg,
@@ -2740,7 +2766,7 @@ impl Decompiler {
             .collect();
         let transformed = StructuredCfg {
             body: transformed_body,
-            cfg_entry: structured.cfg_entry,
+            ..structured
         };
 
         // Emit pseudo-code
@@ -2776,298 +2802,552 @@ impl Decompiler {
 /// It identifies which nodes fall within try block address ranges and creates
 /// TryCatch nodes with appropriate catch handlers. Landing pad addresses are
 /// used to extract the actual handler code from the structured output.
+/// Clone `cfg` and add exception-handling (unwind) edges from every block that
+/// overlaps a protected range (a try block or a cleanup range) to that range's
+/// landing-pad block, derived from the LSDA `exception_info`. These edges live on
+/// the CFG's separate EH channel and do not perturb normal control-flow
+/// structuring; the structurer consumes them to recover try/catch shape. Returns
+/// the augmented clone (only blocks overlapping a protected range gain an edge).
+fn augment_cfg_with_eh_edges(
+    cfg: &ControlFlowGraph,
+    exception_info: &ExceptionInfo,
+) -> ControlFlowGraph {
+    let mut cfg = cfg.clone();
+
+    // (protected start, protected end, landing-pad address) for every handler.
+    let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
+    for tb in &exception_info.try_blocks {
+        for h in &tb.handlers {
+            ranges.push((tb.start, tb.end, h.landing_pad));
+        }
+    }
+    for cleanup in &exception_info.cleanup_handlers {
+        ranges.push((cleanup.start, cleanup.end, cleanup.landing_pad));
+    }
+
+    // Snapshot block spans up front so the mutation loop holds no borrow of `cfg`.
+    let blocks: Vec<(hexray_core::BasicBlockId, u64, u64)> =
+        cfg.blocks().map(|b| (b.id, b.start, b.end)).collect();
+
+    for (start, end, landing_pad) in ranges {
+        let Some(lp_block) = cfg.block_containing(landing_pad).map(|b| b.id) else {
+            continue;
+        };
+        for &(block_id, block_start, block_end) in &blocks {
+            // Half-open overlap of the block span with the protected range.
+            if block_end > start && block_start < end {
+                cfg.add_eh_edge(block_id, lp_block);
+            }
+        }
+    }
+
+    cfg
+}
+
 fn apply_exception_handling(
     body: Vec<StructuredNode>,
     exception_info: &ExceptionInfo,
+    cfg: &ControlFlowGraph,
+    landing_pad_bodies: &std::collections::HashMap<hexray_core::BasicBlockId, Vec<StructuredNode>>,
 ) -> Vec<StructuredNode> {
-    if exception_info.try_blocks.is_empty() && exception_info.cleanup_handlers.is_empty() {
+    // Cleanup-only functions carry no source-level try/catch to reconstruct; their
+    // landing pads are destructor unwinding, already structured out of `body`.
+    if exception_info.try_blocks.is_empty() {
         return body;
     }
 
-    // First, build an index of all landing pad addresses
-    let landing_pads: std::collections::HashSet<u64> = exception_info
+    // Protected block-id set per try block: blocks whose start address lies in the
+    // try's protected range. Block ids are identical between the augmented CFG the
+    // structurer saw and this original CFG, so they key the same blocks — a robust
+    // join, unlike matching AST node address ranges (which stop lining up once a
+    // try body structures into an if/loop/switch).
+    let protected: Vec<std::collections::HashSet<hexray_core::BasicBlockId>> = exception_info
         .try_blocks
         .iter()
-        .flat_map(|tb| tb.handlers.iter().map(|h| h.landing_pad))
-        .chain(
-            exception_info
-                .cleanup_handlers
-                .iter()
-                .map(|cleanup| cleanup.landing_pad),
-        )
+        .map(|tb| {
+            // A block is protected if its span overlaps the try's call-site range;
+            // the range is often a sub-span of one block, so require overlap rather
+            // than the block starting inside it.
+            cfg.blocks()
+                .filter(|b| b.end > tb.start && b.start < tb.end)
+                .map(|b| b.id)
+                .collect()
+        })
         .collect();
-
-    // Find nodes that belong to landing pads
-    let mut landing_pad_nodes: std::collections::HashMap<u64, Vec<StructuredNode>> =
-        std::collections::HashMap::new();
-    let mut remaining_body = Vec::new();
-
-    for node in &body {
-        if let Some((node_start, _)) = get_node_address_range(node) {
-            // Check if this node is a landing pad entry
-            if let Some(&lp_addr) = landing_pads.iter().find(|&&lp| {
-                // Node starts at or shortly after landing pad
-                node_start >= lp && node_start < lp + 32
-            }) {
-                landing_pad_nodes
-                    .entry(lp_addr)
-                    .or_default()
-                    .push(node.clone());
-                continue;
-            }
-        }
-        remaining_body.push(node.clone());
-    }
-
-    if exception_info.try_blocks.is_empty() {
-        return wrap_cleanup_regions(
-            remaining_body,
-            &exception_info.cleanup_handlers,
-            &landing_pad_nodes,
-        );
-    }
 
     let mut result = Vec::new();
     let mut i = 0;
+    while i < body.len() {
+        // Which try block (if any) does this top-level node belong to? A node
+        // belongs to try T if any block it contains is protected by T.
+        let node_blocks = block_ids_in_node(&body[i]);
+        let Some(ti) = protected.iter().position(|p| !p.is_disjoint(&node_blocks)) else {
+            result.push(body[i].clone());
+            i += 1;
+            continue;
+        };
 
-    while i < remaining_body.len() {
-        let node = &remaining_body[i];
-
-        // Get the address range of this node
-        if let Some((node_start, node_end)) = get_node_address_range(node) {
-            // Check if this node starts a try block
-            if let Some(try_block) = exception_info
-                .try_blocks
-                .iter()
-                .find(|tb| node_end > tb.start && node_start < tb.end)
-            {
-                // Collect all nodes that fall within this try block
-                let mut try_body = vec![remaining_body[i].clone()];
-                i += 1;
-
-                while i < remaining_body.len() {
-                    if let Some((next_start, next_end)) = get_node_address_range(&remaining_body[i])
-                    {
-                        if next_end > try_block.start && next_start < try_block.end {
-                            try_body.push(remaining_body[i].clone());
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                // Create catch handlers with extracted landing pad bodies
-                let catch_handlers: Vec<structurer::CatchHandler> = try_block
-                    .handlers
-                    .iter()
-                    .map(|h| {
-                        // Get the landing pad body if we found it
-                        let handler_body = landing_pad_nodes
-                            .get(&h.landing_pad)
-                            .cloned()
-                            .unwrap_or_default();
-
-                        structurer::CatchHandler {
-                            exception_type: if h.is_catch_all {
-                                None
-                            } else {
-                                h.catch_type.clone()
-                            },
-                            variable_name: Some("e".to_string()),
-                            body: handler_body,
-                            landing_pad: h.landing_pad,
-                        }
-                    })
-                    .collect();
-
-                // Create the try-catch node
-                result.push(StructuredNode::TryCatch {
-                    try_body,
-                    catch_handlers,
-                });
-                continue;
-            }
+        // Absorb the consecutive run of top-level nodes protected by the same try.
+        let mut try_body = vec![body[i].clone()];
+        i += 1;
+        while i < body.len() && !protected[ti].is_disjoint(&block_ids_in_node(&body[i])) {
+            try_body.push(body[i].clone());
+            i += 1;
         }
 
-        // Not in a try block, add as-is
-        result.push(remaining_body[i].clone());
-        i += 1;
+        let catch_handlers =
+            build_catch_handlers(&exception_info.try_blocks[ti], cfg, landing_pad_bodies);
+        if catch_handlers.is_empty() {
+            // No renderable catch (e.g. a cleanup-only region) — leave it flat.
+            result.extend(try_body);
+        } else {
+            result.push(StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            });
+        }
     }
 
     result
 }
 
-fn wrap_cleanup_regions(
-    body: Vec<StructuredNode>,
-    cleanup_handlers: &[CleanupInfo],
-    landing_pad_nodes: &std::collections::HashMap<u64, Vec<StructuredNode>>,
-) -> Vec<StructuredNode> {
-    let mut result = Vec::new();
-    let mut i = 0;
-
-    while i < body.len() {
-        let node = &body[i];
-
-        if let Some((node_start, node_end)) = get_node_address_range(node) {
-            if let Some(cleanup) = cleanup_handlers
-                .iter()
-                .find(|cleanup| node_end > cleanup.start && node_start < cleanup.end)
-            {
-                let mut try_body = vec![body[i].clone()];
-                i += 1;
-
-                while i < body.len() {
-                    if let Some((next_start, next_end)) = get_node_address_range(&body[i]) {
-                        if next_end > cleanup.start && next_start < cleanup.end {
-                            try_body.push(body[i].clone());
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                result.push(StructuredNode::TryCatch {
-                    try_body,
-                    catch_handlers: vec![structurer::CatchHandler {
-                        exception_type: None,
-                        variable_name: None,
-                        body: landing_pad_nodes
-                            .get(&cleanup.landing_pad)
-                            .cloned()
-                            .unwrap_or_default(),
-                        landing_pad: cleanup.landing_pad,
-                    }],
-                });
-                continue;
-            }
+/// Build the renderable catch handlers for a try block: drop cleanup-only
+/// entries (destructor unwinding, not source catches), dedupe by landing pad,
+/// and attach each handler's structured body from `landing_pad_bodies` (keyed by
+/// the landing-pad block id).
+fn build_catch_handlers(
+    try_block: &TryBlockInfo,
+    cfg: &ControlFlowGraph,
+    landing_pad_bodies: &std::collections::HashMap<hexray_core::BasicBlockId, Vec<StructuredNode>>,
+) -> Vec<structurer::CatchHandler> {
+    let mut handlers = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for h in &try_block.handlers {
+        // A cleanup entry unwinds destructors; it is not a source-level catch.
+        if !h.is_catch_all && h.catch_type.as_deref() == Some("cleanup") {
+            continue;
         }
-
-        result.push(body[i].clone());
-        i += 1;
+        if !seen.insert(h.landing_pad) {
+            continue;
+        }
+        let body = cfg
+            .block_containing(h.landing_pad)
+            .and_then(|lp| landing_pad_bodies.get(&lp.id))
+            .cloned()
+            .unwrap_or_default();
+        handlers.push(structurer::CatchHandler {
+            exception_type: if h.is_catch_all {
+                None
+            } else {
+                h.catch_type.clone()
+            },
+            variable_name: Some("e".to_string()),
+            body,
+            landing_pad: h.landing_pad,
+        });
     }
-
-    if result
-        .iter()
-        .any(|node| matches!(node, StructuredNode::TryCatch { .. }))
-        || cleanup_handlers.len() != 1
-        || body.is_empty()
-    {
-        return result;
-    }
-
-    let cleanup = &cleanup_handlers[0];
-    vec![StructuredNode::TryCatch {
-        try_body: body,
-        catch_handlers: vec![structurer::CatchHandler {
-            exception_type: None,
-            variable_name: None,
-            body: landing_pad_nodes
-                .get(&cleanup.landing_pad)
-                .cloned()
-                .unwrap_or_default(),
-            landing_pad: cleanup.landing_pad,
-        }],
-    }]
+    handlers
 }
 
-#[cfg(test)]
-fn catch_handler_body_len(catch_handlers: &[structurer::CatchHandler]) -> usize {
-    catch_handlers
-        .first()
-        .map(|handler| handler.body.len())
-        .unwrap_or(0)
+/// All basic-block ids appearing anywhere inside a structured node.
+fn block_ids_in_node(
+    node: &StructuredNode,
+) -> std::collections::HashSet<hexray_core::BasicBlockId> {
+    let mut ids = std::collections::HashSet::new();
+    collect_block_ids(node, &mut ids);
+    ids
 }
 
-#[cfg(test)]
-fn is_catch_all_handler(catch_handlers: &[structurer::CatchHandler]) -> bool {
-    catch_handlers
-        .first()
-        .is_some_and(|handler| handler.exception_type.is_none())
-}
-
-/// Gets the address range of a structured node.
-fn get_node_address_range(node: &StructuredNode) -> Option<(u64, u64)> {
+fn collect_block_ids(
+    node: &StructuredNode,
+    ids: &mut std::collections::HashSet<hexray_core::BasicBlockId>,
+) {
     match node {
-        StructuredNode::Block { address_range, .. } => Some(*address_range),
+        StructuredNode::Block { id, .. } | StructuredNode::Label(id) => {
+            ids.insert(*id);
+        }
         StructuredNode::If {
             then_body,
             else_body,
             ..
         } => {
-            let start = then_body
-                .first()
-                .and_then(get_node_address_range)
-                .map(|(s, _)| s)?;
-            let end = else_body
-                .as_ref()
-                .and_then(|e| e.last())
-                .or(then_body.last())
-                .and_then(get_node_address_range)
-                .map(|(_, e)| e)?;
-            Some((start, end))
+            for n in then_body {
+                collect_block_ids(n, ids);
+            }
+            if let Some(e) = else_body {
+                for n in e {
+                    collect_block_ids(n, ids);
+                }
+            }
         }
         StructuredNode::While { body, .. }
         | StructuredNode::DoWhile { body, .. }
-        | StructuredNode::Loop { body, .. }
-        | StructuredNode::Sequence(body) => {
-            let start = body
-                .first()
-                .and_then(get_node_address_range)
-                .map(|(s, _)| s)?;
-            let end = body
-                .last()
-                .and_then(get_node_address_range)
-                .map(|(_, e)| e)?;
-            Some((start, end))
-        }
-        StructuredNode::For { body, .. } => {
-            let start = body
-                .first()
-                .and_then(get_node_address_range)
-                .map(|(s, _)| s)?;
-            let end = body
-                .last()
-                .and_then(get_node_address_range)
-                .map(|(_, e)| e)?;
-            Some((start, end))
+        | StructuredNode::For { body, .. }
+        | StructuredNode::Loop { body, .. } => {
+            for n in body {
+                collect_block_ids(n, ids);
+            }
         }
         StructuredNode::Switch { cases, default, .. } => {
-            let mut all_nodes = Vec::new();
-            for (_, body) in cases {
-                all_nodes.extend(body.iter());
+            for (_, b) in cases {
+                for n in b {
+                    collect_block_ids(n, ids);
+                }
             }
             if let Some(d) = default {
-                all_nodes.extend(d.iter());
+                for n in d {
+                    collect_block_ids(n, ids);
+                }
             }
-            let start = all_nodes
-                .first()
-                .and_then(|n| get_node_address_range(n))
-                .map(|(s, _)| s)?;
-            let end = all_nodes
-                .last()
-                .and_then(|n| get_node_address_range(n))
-                .map(|(_, e)| e)?;
-            Some((start, end))
         }
-        StructuredNode::TryCatch { try_body, .. } => {
-            let start = try_body
-                .first()
-                .and_then(get_node_address_range)
-                .map(|(s, _)| s)?;
-            let end = try_body
-                .last()
-                .and_then(get_node_address_range)
-                .map(|(_, e)| e)?;
-            Some((start, end))
+        StructuredNode::Sequence(inner) => {
+            for n in inner {
+                collect_block_ids(n, ids);
+            }
         }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            for n in try_body {
+                collect_block_ids(n, ids);
+            }
+            for h in catch_handlers {
+                for n in &h.body {
+                    collect_block_ids(n, ids);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Itanium EH runtime calls that are pure landing-pad scaffolding — the mechanics
+/// of entering/leaving a catch, not user code.
+fn is_eh_scaffolding_runtime_name(name: &str) -> bool {
+    matches!(
+        name,
+        "__cxa_begin_catch"
+            | "__cxa_end_catch"
+            | "__cxa_free_exception"
+            | "__cxa_get_exception_ptr"
+            | "_Unwind_Resume"
+    )
+}
+
+/// Whether `name` is a raw x86-64 general-purpose register (any width). Used to
+/// recognise the compiler's type-selector temporary — a register never carries a
+/// user variable at this stage, so gating the selector-`if` unwrap on one avoids
+/// mistaking a real `if (x == N)` in a handler for the type dispatch.
+fn is_raw_register_name(name: &str) -> bool {
+    matches!(
+        name,
+        "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp"
+            | "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi"
+            | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
+            | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d"
+    )
+}
+
+/// The call-target name of a statement if it is a call — bare `f(...)` or captured
+/// into a temporary `t = f(...)` — resolving relocation/symbol-backed `Direct`
+/// targets via `resolve`.
+fn statement_call_name<F>(expr: &Expr, resolve: &F) -> Option<String>
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    let call = match &expr.kind {
+        ExprKind::Call { .. } => expr,
+        ExprKind::Assign { rhs, .. } => rhs.as_ref(),
+        _ => return None,
+    };
+    let ExprKind::Call { target, .. } = &call.kind else {
+        return None;
+    };
+    match target {
+        expression::CallTarget::Named(n) => {
+            Some(hexray_core::unversioned_symbol_name(n).to_string())
+        }
+        expression::CallTarget::Direct {
+            target: addr,
+            call_site,
+        } => resolve(*addr, *call_site)
+            .map(|n| hexray_core::unversioned_symbol_name(&n).to_string()),
         _ => None,
     }
+}
+
+/// Whether `cond` is a type-selector comparison `<reg> == <int>` (either operand
+/// order) — the shape of the compiler's catch-type dispatch guard.
+fn is_selector_condition(cond: &Expr) -> bool {
+    let ExprKind::BinOp {
+        op: BinOpKind::Eq,
+        left,
+        right,
+    } = &cond.kind
+    else {
+        return false;
+    };
+    let is_reg = |e: &Expr| match &e.kind {
+        ExprKind::Var(v) => is_raw_register_name(&v.name),
+        ExprKind::Unknown(n) => is_raw_register_name(n),
+        _ => false,
+    };
+    let is_int = |e: &Expr| matches!(&e.kind, ExprKind::IntLit(_));
+    (is_reg(left) && is_int(right)) || (is_reg(right) && is_int(left))
+}
+
+/// Remove pure EH landing-pad scaffolding from recovered catch bodies so the
+/// handler reads like source: drop the `__cxa_begin_catch`/`__cxa_end_catch`/
+/// `_Unwind_Resume`/… runtime calls, and unwrap the trailing type-selector `if`
+/// (we already know the caught type from the catch clause). Recurses so nested
+/// try/catch is handled too.
+fn strip_exception_scaffolding<F>(body: Vec<StructuredNode>, resolve: &F) -> Vec<StructuredNode>
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    body.into_iter()
+        .map(|node| strip_scaffolding_in_node(node, resolve))
+        .collect()
+}
+
+fn strip_scaffolding_in_node<F>(node: StructuredNode, resolve: &F) -> StructuredNode
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    match node {
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: strip_exception_scaffolding(try_body, resolve),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| structurer::CatchHandler {
+                    body: clean_catch_body(h.body, resolve),
+                    ..h
+                })
+                .collect(),
+        },
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: strip_exception_scaffolding(then_body, resolve),
+            else_body: else_body.map(|e| strip_exception_scaffolding(e, resolve)),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: strip_exception_scaffolding(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: strip_exception_scaffolding(body, resolve),
+            condition,
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: strip_exception_scaffolding(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: strip_exception_scaffolding(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(v, b)| (v, strip_exception_scaffolding(b, resolve)))
+                .collect(),
+            default: default.map(|d| strip_exception_scaffolding(d, resolve)),
+        },
+        StructuredNode::Sequence(inner) => {
+            StructuredNode::Sequence(strip_exception_scaffolding(inner, resolve))
+        }
+        other => other,
+    }
+}
+
+/// Clean a single recovered catch handler body: drop scaffolding-call statements
+/// everywhere, then unwrap a trailing type-selector `if`.
+fn clean_catch_body<F>(body: Vec<StructuredNode>, resolve: &F) -> Vec<StructuredNode>
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    let mut cleaned = drop_scaffolding_calls(body, resolve);
+
+    // Unwrap a trailing `if (<selector> == N) { handler }` (no meaningful else):
+    // the catch clause already encodes the matched type, so the guard is
+    // redundant. Gated on a register-vs-int condition so a genuine handler `if`
+    // is not promoted.
+    if let Some(StructuredNode::If {
+        condition,
+        then_body,
+        else_body,
+    }) = cleaned.last()
+    {
+        let else_empty = else_body.as_ref().map_or(true, |e| e.is_empty());
+        if else_empty && !then_body.is_empty() && is_selector_condition(condition) {
+            let StructuredNode::If { then_body, .. } = cleaned.pop().expect("checked last") else {
+                unreachable!()
+            };
+            cleaned.extend(then_body);
+        }
+    }
+
+    cleaned
+}
+
+/// Drop pure EH scaffolding-call statements from a node list, recursing into
+/// nested structural nodes and `Block` statement lists.
+fn drop_scaffolding_calls<F>(body: Vec<StructuredNode>, resolve: &F) -> Vec<StructuredNode>
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    let is_scaffold = |e: &Expr| {
+        statement_call_name(e, resolve).is_some_and(|n| is_eh_scaffolding_runtime_name(&n))
+    };
+    let mut out = Vec::with_capacity(body.len());
+    for node in body {
+        match node {
+            StructuredNode::Expr(e) => {
+                if !is_scaffold(&e) {
+                    out.push(StructuredNode::Expr(e));
+                }
+            }
+            StructuredNode::Block {
+                id,
+                mut statements,
+                address_range,
+            } => {
+                statements.retain(|s| !is_scaffold(s));
+                // Drop a block that held only scaffolding (e.g. the `_Unwind_Resume`
+                // tail) so it does not sit between the handler and the end of the
+                // catch body and block the selector-`if` unwrap.
+                if !statements.is_empty() {
+                    out.push(StructuredNode::Block {
+                        id,
+                        statements,
+                        address_range,
+                    });
+                }
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => out.push(StructuredNode::If {
+                condition,
+                then_body: drop_scaffolding_calls(then_body, resolve),
+                else_body: else_body.map(|e| drop_scaffolding_calls(e, resolve)),
+            }),
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            } => out.push(StructuredNode::While {
+                condition,
+                body: drop_scaffolding_calls(body, resolve),
+                header,
+                exit_block,
+            }),
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            } => out.push(StructuredNode::DoWhile {
+                body: drop_scaffolding_calls(body, resolve),
+                condition,
+                header,
+                exit_block,
+            }),
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                header,
+                exit_block,
+            } => out.push(StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: drop_scaffolding_calls(body, resolve),
+                header,
+                exit_block,
+            }),
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => out.push(StructuredNode::Loop {
+                body: drop_scaffolding_calls(body, resolve),
+                header,
+                exit_block,
+            }),
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => out.push(StructuredNode::Switch {
+                value,
+                cases: cases
+                    .into_iter()
+                    .map(|(v, b)| (v, drop_scaffolding_calls(b, resolve)))
+                    .collect(),
+                default: default.map(|d| drop_scaffolding_calls(d, resolve)),
+            }),
+            StructuredNode::Sequence(inner) => {
+                out.push(StructuredNode::Sequence(drop_scaffolding_calls(inner, resolve)))
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => out.push(StructuredNode::TryCatch {
+                try_body: drop_scaffolding_calls(try_body, resolve),
+                catch_handlers,
+            }),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3466,87 +3746,31 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_exception_handling_wraps_cleanup_only_landing_pad_in_catch_all() {
-        let body = vec![
-            StructuredNode::Block {
-                id: BasicBlockId::new(0),
-                statements: vec![Expr::unknown("live_stmt")],
-                address_range: (0x1000, 0x1008),
-            },
-            StructuredNode::Block {
-                id: BasicBlockId::new(1),
-                statements: vec![Expr::unknown("cleanup_stmt")],
-                address_range: (0x1200, 0x1208),
-            },
-        ];
-        let info = ExceptionInfo {
-            try_blocks: Vec::new(),
-            cleanup_handlers: vec![CleanupInfo {
-                start: 0x1000,
-                end: 0x1010,
-                landing_pad: 0x1200,
-            }],
-        };
+    fn test_apply_exception_handling_wraps_try_by_protected_block_id() {
+        // Block-id-based assembly: the try body is the run of top-level nodes
+        // containing a block that overlaps the try's protected range; the catch
+        // body is looked up from `landing_pad_bodies` by the landing-pad block id.
+        // Handler blocks live in `landing_pad_bodies`, NOT the main body.
+        let body = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::unknown("call_stmt")],
+            address_range: (0x1000, 0x1018),
+        }];
 
-        let filtered = apply_exception_handling(body, &info);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut b0 = hexray_core::BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        b0.end = 0x1018;
+        let mut lp = hexray_core::BasicBlock::new(BasicBlockId::new(1), 0x1200);
+        lp.end = 0x1208;
+        cfg.add_block(b0);
+        cfg.add_block(lp);
 
-        assert_eq!(filtered.len(), 1);
-        match &filtered[0] {
-            StructuredNode::TryCatch {
-                try_body,
-                catch_handlers,
-            } => {
-                assert_eq!(try_body.len(), 1);
-                assert_eq!(catch_handlers.len(), 1);
-                assert_eq!(catch_handler_body_len(catch_handlers), 1);
-                assert!(is_catch_all_handler(catch_handlers));
-            }
-            other => panic!("expected synthetic try/catch, got {other:?}"),
-        }
-    }
+        let mut landing_pad_bodies = std::collections::HashMap::new();
+        landing_pad_bodies.insert(
+            BasicBlockId::new(1),
+            vec![StructuredNode::Expr(Expr::unknown("handler_stmt"))],
+        );
 
-    #[test]
-    fn test_apply_exception_handling_wraps_cleanup_only_expr_body_with_single_handler() {
-        let body = vec![StructuredNode::Expr(Expr::unknown("live_stmt"))];
-        let info = ExceptionInfo {
-            try_blocks: Vec::new(),
-            cleanup_handlers: vec![CleanupInfo {
-                start: 0x1000,
-                end: 0x1010,
-                landing_pad: 0x1200,
-            }],
-        };
-
-        let wrapped = apply_exception_handling(body, &info);
-
-        assert_eq!(wrapped.len(), 1);
-        match &wrapped[0] {
-            StructuredNode::TryCatch {
-                try_body,
-                catch_handlers,
-            } => {
-                assert_eq!(try_body.len(), 1);
-                assert_eq!(catch_handlers.len(), 1);
-                assert!(is_catch_all_handler(catch_handlers));
-            }
-            other => panic!("expected synthetic try/catch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_apply_exception_handling_wraps_blocks_that_overlap_try_range() {
-        let body = vec![
-            StructuredNode::Block {
-                id: BasicBlockId::new(0),
-                statements: vec![Expr::unknown("call_stmt")],
-                address_range: (0x1000, 0x1018),
-            },
-            StructuredNode::Block {
-                id: BasicBlockId::new(1),
-                statements: vec![Expr::unknown("handler_stmt")],
-                address_range: (0x1200, 0x1208),
-            },
-        ];
         let info = ExceptionInfo {
             try_blocks: vec![TryBlockInfo {
                 start: 0x1008,
@@ -3560,7 +3784,7 @@ mod tests {
             cleanup_handlers: Vec::new(),
         };
 
-        let wrapped = apply_exception_handling(body, &info);
+        let wrapped = apply_exception_handling(body, &info, &cfg, &landing_pad_bodies);
 
         assert_eq!(wrapped.len(), 1);
         match &wrapped[0] {
@@ -3570,10 +3794,92 @@ mod tests {
             } => {
                 assert_eq!(try_body.len(), 1);
                 assert_eq!(catch_handlers.len(), 1);
+                assert_eq!(catch_handlers[0].exception_type.as_deref(), Some("MyError"));
                 assert_eq!(catch_handlers[0].body.len(), 1);
             }
             other => panic!("expected try/catch wrapper, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_apply_exception_handling_leaves_cleanup_only_unchanged() {
+        // LSDA cleanup (destructor unwinding) is not a source-level catch, so a
+        // function with no try blocks is returned unchanged.
+        let body = vec![StructuredNode::Expr(Expr::unknown("live_stmt"))];
+        let info = ExceptionInfo {
+            try_blocks: Vec::new(),
+            cleanup_handlers: vec![CleanupInfo {
+                start: 0x1000,
+                end: 0x1010,
+                landing_pad: 0x1200,
+            }],
+        };
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let landing_pad_bodies = std::collections::HashMap::new();
+
+        let result = apply_exception_handling(body, &info, &cfg, &landing_pad_bodies);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], StructuredNode::Expr(_)));
+    }
+
+    #[test]
+    fn strip_exception_scaffolding_cleans_catch_body() {
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let call = |name: &str| {
+            StructuredNode::Expr(Expr::call(
+                expression::CallTarget::Named(name.to_string()),
+                vec![],
+            ))
+        };
+        let body = vec![StructuredNode::TryCatch {
+            try_body: vec![StructuredNode::Expr(Expr::unknown("try_stmt"))],
+            catch_handlers: vec![structurer::CatchHandler {
+                exception_type: Some("MyError".to_string()),
+                variable_name: Some("e".to_string()),
+                landing_pad: 0x100,
+                body: vec![
+                    call("__cxa_free_exception"),
+                    StructuredNode::If {
+                        condition: Expr::binop(
+                            BinOpKind::Eq,
+                            Expr::unknown("rdx"),
+                            Expr::int(1),
+                        ),
+                        then_body: vec![
+                            call("__cxa_begin_catch"),
+                            StructuredNode::Expr(Expr::unknown("handler_stmt")),
+                            call("__cxa_end_catch"),
+                            StructuredNode::Return(None),
+                        ],
+                        else_body: None,
+                    },
+                    call("_Unwind_Resume"),
+                ],
+            }],
+        }];
+
+        let out = strip_exception_scaffolding(body, &resolve);
+        let StructuredNode::TryCatch { catch_handlers, .. } = &out[0] else {
+            panic!("expected TryCatch");
+        };
+        let cb = &catch_handlers[0].body;
+        // Selector `if` unwrapped (no `If` remains).
+        assert!(
+            !cb.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+            "selector if not unwrapped: {cb:?}"
+        );
+        // Handler statement promoted to the top level.
+        assert!(
+            cb.iter().any(|n| matches!(n, StructuredNode::Expr(e)
+                if matches!(&e.kind, ExprKind::Unknown(s) if s == "handler_stmt"))),
+            "handler missing: {cb:?}"
+        );
+        // All scaffolding runtime calls removed.
+        assert!(
+            !cb.iter().any(|n| matches!(n, StructuredNode::Expr(e)
+                if matches!(&e.kind, ExprKind::Call { .. }))),
+            "scaffolding call remains: {cb:?}"
+        );
     }
 
     #[test]

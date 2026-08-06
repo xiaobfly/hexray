@@ -4407,6 +4407,19 @@ pub(super) fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
         StructuredNode::Sequence(nodes) => {
             StructuredNode::Sequence(simplify_sequence_node_copies(nodes))
         }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: try_body.into_iter().map(simplify_node_copies).collect(),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| super::CatchHandler {
+                    body: h.body.into_iter().map(simplify_node_copies).collect(),
+                    ..h
+                })
+                .collect(),
+        },
         // Pass through other nodes unchanged
         other => other,
     }
