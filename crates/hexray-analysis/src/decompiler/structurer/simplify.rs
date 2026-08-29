@@ -4407,6 +4407,19 @@ pub(super) fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
         StructuredNode::Sequence(nodes) => {
             StructuredNode::Sequence(simplify_sequence_node_copies(nodes))
         }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: try_body.into_iter().map(simplify_node_copies).collect(),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| super::CatchHandler {
+                    body: h.body.into_iter().map(simplify_node_copies).collect(),
+                    ..h
+                })
+                .collect(),
+        },
         // Pass through other nodes unchanged
         other => other,
     }
@@ -5876,18 +5889,18 @@ fn substitute_call_target_vars(
 }
 
 /// Recursively propagates function call arguments through structured nodes.
-pub(super) fn propagate_call_args(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+pub fn propagate_call_args(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     propagate_call_args_with_binary_data_and_arch(nodes, None, None)
 }
 
-pub(super) fn propagate_call_args_with_binary_data(
+pub fn propagate_call_args_with_binary_data(
     nodes: Vec<StructuredNode>,
     binary_data: Option<&BinaryDataContext>,
 ) -> Vec<StructuredNode> {
     propagate_call_args_with_binary_data_and_arch(nodes, binary_data, None)
 }
 
-pub(super) fn propagate_call_args_with_binary_data_and_arch(
+pub fn propagate_call_args_with_binary_data_and_arch(
     nodes: Vec<StructuredNode>,
     binary_data: Option<&BinaryDataContext>,
     arch: Option<Architecture>,
@@ -5896,7 +5909,7 @@ pub(super) fn propagate_call_args_with_binary_data_and_arch(
     propagate_call_args_node_sequence(nodes, binary_data, preferred_family)
 }
 
-pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
+pub fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
     propagate_call_args_node_with_binary_data(node, None, None)
 }
 

@@ -8,7 +8,7 @@ use crate::{BasicBlock, BasicBlockId};
 ///
 /// The CFG represents the structure of control flow within a function,
 /// with nodes being basic blocks and edges being possible control transfers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ControlFlowGraph {
     /// Entry block ID.
@@ -19,6 +19,16 @@ pub struct ControlFlowGraph {
     successors: IndexMap<BasicBlockId, Vec<BasicBlockId>>,
     /// Backward edges (block -> predecessors).
     predecessors: IndexMap<BasicBlockId, Vec<BasicBlockId>>,
+    /// Exception-handling (unwind) edges: block -> its landing pad(s). Kept
+    /// SEPARATE from `successors`/`predecessors` so normal control-flow analysis
+    /// (dominators, loops, region structuring, RPO) is unaffected — an unwind
+    /// edge is taken only when a call in the block throws, not as ordinary
+    /// control flow. Consumers query it explicitly to recover try/catch shape.
+    #[cfg_attr(feature = "serde", serde(default))]
+    eh_successors: IndexMap<BasicBlockId, Vec<BasicBlockId>>,
+    /// Reverse of `eh_successors`: landing pad -> the blocks that unwind to it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    eh_predecessors: IndexMap<BasicBlockId, Vec<BasicBlockId>>,
 }
 
 impl ControlFlowGraph {
@@ -29,6 +39,8 @@ impl ControlFlowGraph {
             blocks: IndexMap::new(),
             successors: IndexMap::new(),
             predecessors: IndexMap::new(),
+            eh_successors: IndexMap::new(),
+            eh_predecessors: IndexMap::new(),
         }
     }
 
@@ -44,6 +56,51 @@ impl ControlFlowGraph {
     pub fn add_edge(&mut self, from: BasicBlockId, to: BasicBlockId) {
         self.successors.entry(from).or_default().push(to);
         self.predecessors.entry(to).or_default().push(from);
+    }
+
+    /// Adds an exception-handling (unwind) edge from `from` — a block whose
+    /// calls may throw — to `to`, its landing pad. This does NOT create a normal
+    /// control-flow successor/predecessor, so it never perturbs dominators,
+    /// loops, or region structuring; it only records the unwind relationship for
+    /// try/catch recovery. Duplicate edges are ignored (many call blocks in a
+    /// try share one landing pad, and one edge each is enough).
+    pub fn add_eh_edge(&mut self, from: BasicBlockId, to: BasicBlockId) {
+        let succ = self.eh_successors.entry(from).or_default();
+        if !succ.contains(&to) {
+            succ.push(to);
+        }
+        let pred = self.eh_predecessors.entry(to).or_default();
+        if !pred.contains(&from) {
+            pred.push(from);
+        }
+    }
+
+    /// Returns the landing pads that `id` may unwind to (exception-handling
+    /// successors). Empty for a block with no unwind edges.
+    pub fn eh_successors(&self, id: BasicBlockId) -> &[BasicBlockId] {
+        self.eh_successors
+            .get(&id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Returns the blocks that unwind to `id` (exception-handling predecessors).
+    /// Non-empty exactly when `id` is a landing pad.
+    pub fn eh_predecessors(&self, id: BasicBlockId) -> &[BasicBlockId] {
+        self.eh_predecessors
+            .get(&id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Whether `id` is a landing pad (the target of at least one unwind edge).
+    pub fn is_landing_pad(&self, id: BasicBlockId) -> bool {
+        self.eh_predecessors.get(&id).is_some_and(|p| !p.is_empty())
+    }
+
+    /// Whether the CFG carries any exception-handling edges.
+    pub fn has_eh_edges(&self) -> bool {
+        self.eh_successors.values().any(|v| !v.is_empty())
     }
 
     /// Returns a reference to a block by ID.
@@ -381,6 +438,58 @@ mod tests {
         cfg.add_edge(bb0, bb1);
 
         assert_eq!(cfg.predecessors(bb1), &[bb0]);
+    }
+
+    #[test]
+    fn test_eh_edges_are_separate_from_normal_edges() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010)); // landing pad
+
+        let bb0 = BasicBlockId::new(0);
+        let lp = BasicBlockId::new(1);
+        cfg.add_eh_edge(bb0, lp);
+
+        // Recorded on the EH channel...
+        assert_eq!(cfg.eh_successors(bb0), &[lp]);
+        assert_eq!(cfg.eh_predecessors(lp), &[bb0]);
+        assert!(cfg.is_landing_pad(lp));
+        assert!(!cfg.is_landing_pad(bb0));
+        assert!(cfg.has_eh_edges());
+        // ...but NOT on the normal control-flow channel, so structuring is
+        // unaffected.
+        assert!(cfg.successors(bb0).is_empty());
+        assert!(cfg.predecessors(lp).is_empty());
+    }
+
+    #[test]
+    fn test_eh_edges_dedup_and_share_landing_pad() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020)); // shared landing pad
+
+        let bb0 = BasicBlockId::new(0);
+        let bb1 = BasicBlockId::new(1);
+        let lp = BasicBlockId::new(2);
+        cfg.add_eh_edge(bb0, lp);
+        cfg.add_eh_edge(bb0, lp); // duplicate — ignored
+        cfg.add_eh_edge(bb1, lp);
+
+        assert_eq!(cfg.eh_successors(bb0), &[lp]);
+        assert_eq!(cfg.eh_predecessors(lp), &[bb0, bb1]);
+    }
+
+    #[test]
+    fn test_no_eh_edges_by_default() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+        cfg.add_block(make_block(0, 0x1000));
+        assert!(!cfg.has_eh_edges());
+        assert!(cfg.eh_successors(BasicBlockId::new(0)).is_empty());
+        assert!(!cfg.is_landing_pad(BasicBlockId::new(0)));
     }
 
     #[test]
