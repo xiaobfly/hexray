@@ -5889,18 +5889,18 @@ fn substitute_call_target_vars(
 }
 
 /// Recursively propagates function call arguments through structured nodes.
-pub(super) fn propagate_call_args(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+pub fn propagate_call_args(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     propagate_call_args_with_binary_data_and_arch(nodes, None, None)
 }
 
-pub(super) fn propagate_call_args_with_binary_data(
+pub fn propagate_call_args_with_binary_data(
     nodes: Vec<StructuredNode>,
     binary_data: Option<&BinaryDataContext>,
 ) -> Vec<StructuredNode> {
     propagate_call_args_with_binary_data_and_arch(nodes, binary_data, None)
 }
 
-pub(super) fn propagate_call_args_with_binary_data_and_arch(
+pub fn propagate_call_args_with_binary_data_and_arch(
     nodes: Vec<StructuredNode>,
     binary_data: Option<&BinaryDataContext>,
     arch: Option<Architecture>,
@@ -5909,7 +5909,7 @@ pub(super) fn propagate_call_args_with_binary_data_and_arch(
     propagate_call_args_node_sequence(nodes, binary_data, preferred_family)
 }
 
-pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
+pub fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
     propagate_call_args_node_with_binary_data(node, None, None)
 }
 

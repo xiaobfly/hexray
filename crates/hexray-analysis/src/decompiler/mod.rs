@@ -2895,58 +2895,925 @@ fn apply_exception_handling(
             i += 1;
         }
 
+        // Filter the try body to identify protected sub-nodes within compound nodes.
+        // This handles cases like `if(x){ try{foo} } else { bar }` where only one
+        // arm of the if contains protected blocks (P1-4 fix).
+        let try_body = filter_protected_nodes(try_body, &protected[ti]);
+
+        // Check if the filtered try body contains compound nodes with partial protection.
+        // If so, we need to wrap the protected sub-nodes, not the entire compound node.
         let catch_handlers =
             build_catch_handlers(&exception_info.try_blocks[ti], cfg, landing_pad_bodies);
         if catch_handlers.is_empty() {
             // No renderable catch (e.g. a cleanup-only region) — leave it flat.
             result.extend(try_body);
         } else {
-            result.push(StructuredNode::TryCatch {
-                try_body,
-                catch_handlers,
-            });
+            // We have catch handlers - check if we need to handle partial protection
+            let try_is_compound_with_partial_protection = try_body.len() == 1
+                && matches!(try_body[0], StructuredNode::If { .. });
+
+            if try_is_compound_with_partial_protection {
+                // The try body is a compound node (like If) with partial protection.
+                // We need to wrap only the protected sub-nodes, not the entire node.
+                let wrapped_try_body = wrap_protected_subnodes(try_body, &protected[ti], &catch_handlers);
+                result.extend(wrapped_try_body);
+            } else {
+                result.push(StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                });
+            }
         }
     }
 
     result
 }
 
+/// Recursively process catch handler bodies to reconstruct nested try blocks.
+///
+/// P2-5 fix: Catch handler bodies were structured without exception_info, so
+/// any nested try blocks weren't converted to TryCatch nodes. This function
+/// processes the handler body and any nested try blocks it contains.
+fn process_catch_handler_body(
+    body: Vec<StructuredNode>,
+    try_block: &TryBlockInfo,
+    cfg: &ControlFlowGraph,
+    landing_pad_bodies: &std::collections::HashMap<hexray_core::BasicBlockId, Vec<StructuredNode>>,
+) -> Vec<StructuredNode> {
+    // Filter try blocks to only those that are nested inside this handler's body.
+    // A nested try block is one whose protected range is contained within the
+    // handler's protected range.
+
+    // Find nested try blocks: try blocks whose protected range overlaps with
+    // the handler's protected blocks but is not the main try block.
+    let nested_try_blocks: Vec<TryBlockInfo> = try_block
+        .handlers
+        .iter()
+        .filter_map(|h| {
+            // Skip cleanup handlers
+            if !h.is_catch_all && h.catch_type.as_deref() == Some("cleanup") {
+                return None;
+            }
+            // Skip handlers that are part of this try_block's handlers
+            if h.landing_pad == try_block.start {
+                return None;
+            }
+            Some(TryBlockInfo {
+                start: try_block.start,
+                end: try_block.end,
+                handlers: vec![h.clone()],
+            })
+        })
+        .collect();
+
+    if nested_try_blocks.is_empty() {
+        return body;
+    }
+
+    let nested_exception_info = ExceptionInfo {
+        try_blocks: nested_try_blocks,
+        cleanup_handlers: Vec::new(),
+    };
+
+    apply_exception_handling(body, &nested_exception_info, cfg, landing_pad_bodies)
+}
+
+/// Filter a list of nodes, returning a new list where compound nodes with partial
+/// protection have their protected sub-nodes extracted. Nodes that are fully
+/// protected are kept as-is; nodes that are not protected are kept as-is.
+/// Partially protected compound nodes have their protected sub-nodes identified
+/// for wrapping by the caller.
+///
+/// This handles the P1-4 bug: when a compound node (like If) has only some
+/// sub-nodes protected by a try block, we descend into the compound node and
+/// return the protected sub-nodes so they can be wrapped individually.
+fn filter_protected_nodes(
+    nodes: Vec<StructuredNode>,
+    protected_set: &std::collections::HashSet<hexray_core::BasicBlockId>,
+) -> Vec<StructuredNode> {
+    // Fast path: if no protected blocks, return unchanged.
+    if protected_set.is_empty() {
+        return nodes;
+    }
+
+    // Check if a node is fully protected (all its blocks are in protected_set).
+    // We use this to decide whether to descend into a compound node.
+    fn is_fully_protected(
+        node: &StructuredNode,
+        protected_set: &std::collections::HashSet<hexray_core::BasicBlockId>,
+    ) -> bool {
+        let node_blocks = block_ids_in_node(node);
+        !node_blocks.is_empty() && node_blocks.is_subset(protected_set)
+    }
+
+    // Recursive helper that processes a list of nodes.
+    // Returns a list where compound nodes with partial protection have been
+    // descended into (so protected sub-nodes can be identified).
+    fn process_nodes(
+        nodes: Vec<StructuredNode>,
+        protected_set: &std::collections::HashSet<hexray_core::BasicBlockId>,
+    ) -> Vec<StructuredNode> {
+        let mut result = Vec::new();
+
+        for node in nodes {
+            let node_protected_blocks = block_ids_in_node(&node);
+
+            if node_protected_blocks.is_disjoint(protected_set) {
+                // No protected blocks - keep as-is
+                result.push(node);
+                continue;
+            }
+
+            // This node contains protected blocks.
+            match node {
+                StructuredNode::Block { .. }
+                | StructuredNode::Label(_)
+                | StructuredNode::Expr(_)
+                | StructuredNode::Return(_)
+                | StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Goto(_) => {
+                    // Atomic nodes with protected blocks - keep as-is (will be wrapped at higher level)
+                    result.push(node);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    // For If: check if then and else are fully protected.
+                    let then_seq = StructuredNode::Sequence(then_body.clone());
+                    let else_seq = else_body.as_ref().map(|b| StructuredNode::Sequence(b.clone()));
+                    let then_is_fully_protected = is_fully_protected(&then_seq, protected_set);
+                    let else_is_fully_protected = else_seq
+                        .as_ref()
+                        .map(|e| is_fully_protected(e, protected_set))
+                        .unwrap_or(false);
+
+                    if then_is_fully_protected && else_is_fully_protected {
+                        // Both arms fully protected - keep the entire If (will be wrapped at higher level)
+                        result.push(StructuredNode::If {
+                            condition,
+                            then_body,
+                            else_body,
+                        });
+                    } else if then_is_fully_protected {
+                        // Only then arm fully protected - descend into else arm
+                        let filtered_else = else_body
+                            .as_ref()
+                            .map(|b| process_nodes(b.clone(), protected_set));
+                        result.push(StructuredNode::If {
+                            condition,
+                            then_body: then_body.clone(),
+                            else_body: filtered_else,
+                        });
+                    } else if else_is_fully_protected {
+                        // Only else arm fully protected - descend into then arm
+                        let filtered_then = process_nodes(then_body.clone(), protected_set);
+                        result.push(StructuredNode::If {
+                            condition,
+                            then_body: filtered_then,
+                            else_body: else_body.clone(),
+                        });
+                    } else {
+                        // Neither arm fully protected - descend into both
+                        let filtered_then = process_nodes(then_body.clone(), protected_set);
+                        let filtered_else = else_body
+                            .as_ref()
+                            .map(|b| process_nodes(b.clone(), protected_set));
+                        result.push(StructuredNode::If {
+                            condition,
+                            then_body: filtered_then,
+                            else_body: filtered_else,
+                        });
+                    }
+                }
+                StructuredNode::While {
+                    condition,
+                    body,
+                    header,
+                    exit_block,
+                } => {
+                    let body_seq = StructuredNode::Sequence(body.clone());
+                    let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+                    if body_is_fully_protected {
+                        // Entire loop body protected - keep as-is (will be wrapped at higher level)
+                        result.push(StructuredNode::While {
+                            condition,
+                            body,
+                            header,
+                            exit_block,
+                        });
+                    } else {
+                        // Partial protection - descend into body
+                        let filtered_body = process_nodes(body.clone(), protected_set);
+                        result.push(StructuredNode::While {
+                            condition,
+                            body: filtered_body,
+                            header,
+                            exit_block,
+                        });
+                    }
+                }
+                StructuredNode::DoWhile {
+                    body,
+                    condition,
+                    header,
+                    exit_block,
+                } => {
+                    let body_seq = StructuredNode::Sequence(body.clone());
+                    let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+                    if body_is_fully_protected {
+                        result.push(StructuredNode::DoWhile {
+                            body,
+                            condition,
+                            header,
+                            exit_block,
+                        });
+                    } else {
+                        let filtered_body = process_nodes(body.clone(), protected_set);
+                        result.push(StructuredNode::DoWhile {
+                            body: filtered_body,
+                            condition,
+                            header,
+                            exit_block,
+                        });
+                    }
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    header,
+                    exit_block,
+                } => {
+                    let body_seq = StructuredNode::Sequence(body.clone());
+                    let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+                    if body_is_fully_protected {
+                        result.push(StructuredNode::For {
+                            init,
+                            condition,
+                            update,
+                            body,
+                            header,
+                            exit_block,
+                        });
+                    } else {
+                        let filtered_body = process_nodes(body.clone(), protected_set);
+                        result.push(StructuredNode::For {
+                            init,
+                            condition,
+                            update,
+                            body: filtered_body,
+                            header,
+                            exit_block,
+                        });
+                    }
+                }
+                StructuredNode::Loop {
+                    body,
+                    header,
+                    exit_block,
+                } => {
+                    let body_seq = StructuredNode::Sequence(body.clone());
+                    let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+                    if body_is_fully_protected {
+                        result.push(StructuredNode::Loop {
+                            body,
+                            header,
+                            exit_block,
+                        });
+                    } else {
+                        let filtered_body = process_nodes(body.clone(), protected_set);
+                        result.push(StructuredNode::Loop {
+                            body: filtered_body,
+                            header,
+                            exit_block,
+                        });
+                    }
+                }
+                StructuredNode::Switch { cases, default, value } => {
+                    // For switch: each case may be partially protected
+                    let switch_seq = StructuredNode::Switch {
+                        value: value.clone(),
+                        cases: cases.clone(),
+                        default: default.clone(),
+                    };
+                    let switch_is_fully_protected = is_fully_protected(&switch_seq, protected_set);
+
+                    if switch_is_fully_protected {
+                        result.push(StructuredNode::Switch {
+                            value,
+                            cases,
+                            default,
+                        });
+                    } else {
+                        // Partial protection - descend into each case/default
+                        let filtered_cases = cases
+                            .into_iter()
+                            .map(|(vals, body)| {
+                                let filtered_body = process_nodes(body, protected_set);
+                                (vals, filtered_body)
+                            })
+                            .collect();
+                        let filtered_default = default.map(|body| process_nodes(body, protected_set));
+                        result.push(StructuredNode::Switch {
+                            value,
+                            cases: filtered_cases,
+                            default: filtered_default,
+                        });
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    // If the sequence is fully protected, keep as-is.
+                    // Otherwise, descend into it.
+                    let seq_seq = StructuredNode::Sequence(inner.clone());
+                    let seq_is_fully_protected = is_fully_protected(&seq_seq, protected_set);
+
+                    if seq_is_fully_protected {
+                        result.push(StructuredNode::Sequence(inner));
+                    } else {
+                        let filtered_inner = process_nodes(inner, protected_set);
+                        result.push(StructuredNode::Sequence(filtered_inner));
+                    }
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    // Recursively process nested try-catch
+                    let filtered_try = process_nodes(try_body.clone(), protected_set);
+                    let filtered_handlers = catch_handlers
+                        .into_iter()
+                        .map(|h| structurer::CatchHandler {
+                            exception_type: h.exception_type,
+                            variable_name: h.variable_name,
+                            body: process_nodes(h.body.clone(), protected_set),
+                            landing_pad: h.landing_pad,
+                        })
+                        .collect();
+                    result.push(StructuredNode::TryCatch {
+                        try_body: filtered_try,
+                        catch_handlers: filtered_handlers,
+                    });
+                }
+            }
+        }
+
+        result
+    }
+
+    process_nodes(nodes, protected_set)
+}
+
+/// Check if a node is fully protected (all its blocks are in protected_set).
+fn is_fully_protected(
+    node: &StructuredNode,
+    protected_set: &std::collections::HashSet<hexray_core::BasicBlockId>,
+) -> bool {
+    let node_blocks = block_ids_in_node(node);
+    !node_blocks.is_empty() && node_blocks.is_subset(protected_set)
+}
+
+/// Wrap protected sub-nodes in a list of nodes with TryCatch, keeping non-protected
+/// sub-nodes unchanged. This handles the P1-4 bug: when a compound node has only
+/// some sub-nodes protected, we wrap only those sub-nodes.
+fn wrap_protected_subnodes(
+    nodes: Vec<StructuredNode>,
+    protected_set: &std::collections::HashSet<hexray_core::BasicBlockId>,
+    catch_handlers: &[structurer::CatchHandler],
+) -> Vec<StructuredNode> {
+    let mut result = Vec::new();
+
+    for node in nodes {
+        let node_protected_blocks = block_ids_in_node(&node);
+
+        if node_protected_blocks.is_disjoint(protected_set) {
+            // No protected blocks - keep as-is
+            result.push(node);
+            continue;
+        }
+
+        // This node contains protected blocks.
+        // Check if it's a compound node with partial protection.
+        match &node {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                // For If: check if then and else are fully protected.
+                let then_seq = StructuredNode::Sequence(then_body.clone());
+                let else_seq = else_body
+                    .as_ref()
+                    .map(|b| StructuredNode::Sequence(b.clone()));
+                let then_is_fully_protected = is_fully_protected(&then_seq, protected_set);
+                let else_is_fully_protected = else_seq
+                    .as_ref()
+                    .map(|e| is_fully_protected(e, protected_set))
+                    .unwrap_or(false);
+
+                if then_is_fully_protected && else_is_fully_protected {
+                    // Both arms fully protected - wrap the entire If
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::If {
+                            condition: condition.clone(),
+                            then_body: then_body.clone(),
+                            else_body: else_body.clone(),
+                        }],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else if then_is_fully_protected {
+                    // Only then arm fully protected - wrap just the then arm's content,
+                    // keep else arm unchanged
+                    let wrapped_then = wrap_protected_subnodes(then_body.clone(), protected_set, catch_handlers);
+                    let filtered_else = else_body
+                        .as_ref()
+                        .map(|b| wrap_protected_subnodes(b.clone(), protected_set, catch_handlers));
+                    // Create a new If where the protected arm is wrapped
+                    result.push(StructuredNode::If {
+                        condition: condition.clone(),
+                        then_body: wrapped_then,
+                        else_body: filtered_else,
+                    });
+                } else if else_is_fully_protected {
+                    // Only else arm fully protected - wrap just the else arm's content,
+                    // keep then arm unchanged
+                    let filtered_then = wrap_protected_subnodes(then_body.clone(), protected_set, catch_handlers);
+                    let wrapped_else = wrap_protected_subnodes(
+                        else_body.clone().unwrap_or_default(),
+                        protected_set,
+                        catch_handlers,
+                    );
+                    result.push(StructuredNode::If {
+                        condition: condition.clone(),
+                        then_body: filtered_then,
+                        else_body: Some(wrapped_else),
+                    });
+                } else {
+                    // Neither arm fully protected - descend into both
+                    let filtered_then = wrap_protected_subnodes(then_body.clone(), protected_set, catch_handlers);
+                    let filtered_else = else_body
+                        .as_ref()
+                        .map(|b| wrap_protected_subnodes(b.clone(), protected_set, catch_handlers));
+                    result.push(StructuredNode::If {
+                        condition: condition.clone(),
+                        then_body: filtered_then,
+                        else_body: filtered_else,
+                    });
+                }
+            }
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            } => {
+                // For loops, check if the body is fully protected
+                let body_seq = StructuredNode::Sequence(body.clone());
+                let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+
+                if body_is_fully_protected {
+                    // Entire loop body protected - wrap the entire loop
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::While {
+                            condition: condition.clone(),
+                            body: body.clone(),
+                            header: *header,
+                            exit_block: *exit_block,
+                        }],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else {
+                    // Partial protection - wrap the body
+                    let wrapped_body = wrap_protected_subnodes(body.clone(), protected_set, catch_handlers);
+                    result.push(StructuredNode::While {
+                        condition: condition.clone(),
+                        body: wrapped_body,
+                        header: *header,
+                        exit_block: *exit_block,
+                    });
+                }
+            }
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            } => {
+                let body_seq = StructuredNode::Sequence(body.clone());
+                let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+
+                if body_is_fully_protected {
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::DoWhile {
+                            body: body.clone(),
+                            condition: condition.clone(),
+                            header: *header,
+                            exit_block: *exit_block,
+                        }],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else {
+                    let wrapped_body = wrap_protected_subnodes(body.clone(), protected_set, catch_handlers);
+                    result.push(StructuredNode::DoWhile {
+                        body: wrapped_body,
+                        condition: condition.clone(),
+                        header: *header,
+                        exit_block: *exit_block,
+                    });
+                }
+            }
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                header,
+                exit_block,
+            } => {
+                let body_seq = StructuredNode::Sequence(body.clone());
+                let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+
+                if body_is_fully_protected {
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::For {
+                            init: init.clone(),
+                            condition: condition.clone(),
+                            update: update.clone(),
+                            body: body.clone(),
+                            header: *header,
+                            exit_block: *exit_block,
+                        }],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else {
+                    let wrapped_body = wrap_protected_subnodes(body.clone(), protected_set, catch_handlers);
+                    result.push(StructuredNode::For {
+                        init: init.clone(),
+                        condition: condition.clone(),
+                        update: update.clone(),
+                        body: wrapped_body,
+                        header: *header,
+                        exit_block: *exit_block,
+                    });
+                }
+            }
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => {
+                let body_seq = StructuredNode::Sequence(body.clone());
+                let body_is_fully_protected = is_fully_protected(&body_seq, protected_set);
+
+                if body_is_fully_protected {
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::Loop {
+                            body: body.clone(),
+                            header: *header,
+                            exit_block: *exit_block,
+                        }],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else {
+                    let wrapped_body = wrap_protected_subnodes(body.clone(), protected_set, catch_handlers);
+                    result.push(StructuredNode::Loop {
+                        body: wrapped_body,
+                        header: *header,
+                        exit_block: *exit_block,
+                    });
+                }
+            }
+            StructuredNode::Switch { cases, default, value } => {
+                let switch_seq = StructuredNode::Switch {
+                    value: value.clone(),
+                    cases: cases.clone(),
+                    default: default.clone(),
+                };
+                let switch_is_fully_protected = is_fully_protected(&switch_seq, protected_set);
+
+                if switch_is_fully_protected {
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::Switch {
+                            value: value.clone(),
+                            cases: cases.clone(),
+                            default: default.clone(),
+                        }],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else {
+                    let filtered_cases = cases
+                        .clone()
+                        .into_iter()
+                        .map(|(vals, body)| {
+                            let filtered_body = wrap_protected_subnodes(body, protected_set, catch_handlers);
+                            (vals, filtered_body)
+                        })
+                        .collect();
+                    let filtered_default = default.clone().map(|body| wrap_protected_subnodes(body, protected_set, catch_handlers));
+                    result.push(StructuredNode::Switch {
+                        value: value.clone(),
+                        cases: filtered_cases,
+                        default: filtered_default,
+                    });
+                }
+            }
+            StructuredNode::Sequence(inner) => {
+                let seq_seq = StructuredNode::Sequence(inner.clone());
+                let seq_is_fully_protected = is_fully_protected(&seq_seq, protected_set);
+
+                if seq_is_fully_protected {
+                    result.push(StructuredNode::TryCatch {
+                        try_body: vec![StructuredNode::Sequence(inner.clone())],
+                        catch_handlers: catch_handlers.to_vec(),
+                    });
+                } else {
+                    let filtered_inner = wrap_protected_subnodes(inner.clone(), protected_set, catch_handlers);
+                    result.push(StructuredNode::Sequence(filtered_inner));
+                }
+            }
+            _ => {
+                // Non-If compound node or atomic node - wrap it
+                result.push(StructuredNode::TryCatch {
+                    try_body: vec![node],
+                    catch_handlers: catch_handlers.to_vec(),
+                });
+            }
+        }
+    }
+
+    result
+}
+
+/// Extract catch bodies from a selector dispatch pattern in the landing pad body.
+///
+/// The compiler generates a selector dispatch when multiple catch handlers share
+/// one landing pad: `if (reg == selector_1) { handler1 } else if (reg == selector_2) { handler2 } else { handler3 }`.
+/// This function extracts the individual catch bodies for each selector value.
+fn extract_catch_bodies_from_selector_dispatch(
+    body: Vec<StructuredNode>,
+    handlers: &[&CatchInfo],
+) -> Vec<structurer::CatchHandler> {
+    // The selector dispatch pattern is typically an If chain like:
+    // if (reg == selector_1) { body1 } else if (reg == selector_2) { body2 } else { body3 }
+    // We need to match each selector value to the corresponding catch handler.
+
+    // For now, we handle the simple case: a single If node with selector conditions.
+    // In the future, this could be extended to handle more complex dispatch patterns.
+    if body.len() != 1 {
+        // If the body isn't a single node, fall back to using the first handler
+        return handlers
+            .first()
+            .map(|h| structurer::CatchHandler {
+                exception_type: if h.is_catch_all {
+                    None
+                } else {
+                    h.catch_type.clone()
+                },
+                variable_name: Some("e".to_string()),
+                body: body,
+                landing_pad: h.landing_pad,
+            })
+            .into_iter()
+            .collect();
+    }
+
+    match &body[0] {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            // Check if this is a selector condition
+            if extract_selector_value(condition).is_some() {
+                // This is a selector dispatch at the top level
+                // We need to recursively extract all catch bodies from the If chain
+
+                let mut result = Vec::new();
+                extract_selector_branches(condition, then_body, else_body.as_deref(), handlers, &mut result);
+                return result;
+            }
+
+            // Not a top-level selector dispatch, fall back
+            handlers
+                .first()
+                .map(|h| structurer::CatchHandler {
+                    exception_type: if h.is_catch_all {
+                        None
+                    } else {
+                        h.catch_type.clone()
+                    },
+                    variable_name: Some("e".to_string()),
+                    body: body,
+                    landing_pad: h.landing_pad,
+                })
+                .into_iter()
+                .collect()
+        }
+        _ => {
+            // Not an If node, fall back
+            handlers
+                .first()
+                .map(|h| structurer::CatchHandler {
+                    exception_type: if h.is_catch_all {
+                        None
+                    } else {
+                        h.catch_type.clone()
+                    },
+                    variable_name: Some("e".to_string()),
+                    body: body,
+                    landing_pad: h.landing_pad,
+                })
+                .into_iter()
+                .collect()
+        }
+    }
+}
+
+/// Extract the selector value from a selector condition (reg == value).
+fn extract_selector_value(condition: &Expr) -> Option<i128> {
+    let ExprKind::BinOp {
+        op: BinOpKind::Eq,
+        left,
+        right,
+    } = &condition.kind
+    else {
+        return None;
+    };
+
+    let is_reg = |e: &Expr| match &e.kind {
+        ExprKind::Var(v) => is_raw_register_name(&v.name),
+        ExprKind::Unknown(n) => is_raw_register_name(n),
+        _ => false,
+    };
+    let get_int = |e: &Expr| match &e.kind {
+        ExprKind::IntLit(val) => Some(*val),
+        _ => None,
+    };
+
+    if is_reg(left) {
+        get_int(right)
+    } else if is_reg(right) {
+        get_int(left)
+    } else {
+        None
+    }
+}
+
+/// Recursively extract catch bodies from an If chain of selector conditions.
+fn extract_selector_branches(
+    condition: &Expr,
+    then_body: &[StructuredNode],
+    else_body: Option<&[StructuredNode]>,
+    handlers: &[&CatchInfo],
+    result: &mut Vec<structurer::CatchHandler>,
+) {
+    // Extract selector value from current condition
+    if extract_selector_value(condition).is_some() {
+        // Find the handler with the matching selector value
+        // For catch-all, we use the last handler
+        // For typed catches, we need to match by type info
+
+        // Find the handler at this selector position (order matters)
+        if let Some(handler) = handlers.first() {
+            result.push(structurer::CatchHandler {
+                exception_type: if handler.is_catch_all {
+                    None
+                } else {
+                    handler.catch_type.clone()
+                },
+                variable_name: Some("e".to_string()),
+                body: then_body.to_vec(),
+                landing_pad: handler.landing_pad,
+            });
+        }
+
+        // Recurse into else branch if present
+        if let Some(else_branch) = else_body {
+            if else_branch.len() == 1 {
+                if let StructuredNode::If {
+                    condition: next_condition,
+                    then_body: next_then,
+                    else_body: next_else,
+                } = &else_branch[0]
+                {
+                    extract_selector_branches(
+                        next_condition,
+                        next_then,
+                        next_else.as_deref(),
+                        handlers,
+                        result,
+                    );
+                } else {
+                    // Last catch-all handler
+                    if let Some(handler) = handlers.get(1) {
+                        result.push(structurer::CatchHandler {
+                            exception_type: if handler.is_catch_all {
+                                None
+                            } else {
+                                handler.catch_type.clone()
+                            },
+                            variable_name: Some("e".to_string()),
+                            body: else_branch.to_vec(),
+                            landing_pad: handler.landing_pad,
+                        });
+                    }
+                }
+            } else {
+                // Else branch contains the catch-all body
+                if let Some(handler) = handlers.get(1) {
+                    result.push(structurer::CatchHandler {
+                        exception_type: if handler.is_catch_all {
+                            None
+                        } else {
+                            handler.catch_type.clone()
+                        },
+                        variable_name: Some("e".to_string()),
+                        body: else_branch.to_vec(),
+                        landing_pad: handler.landing_pad,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Build the renderable catch handlers for a try block: drop cleanup-only
-/// entries (destructor unwinding, not source catches), dedupe by landing pad,
-/// and attach each handler's structured body from `landing_pad_bodies` (keyed by
-/// the landing-pad block id).
+/// entries (destructor unwinding, not source catches), and attach each handler's
+/// structured body from `landing_pad_bodies` (keyed by the landing-pad block id).
+///
+/// P1-2 fix: Propagate call args in handler body before attaching, so calls
+/// like `sink(x+7)` in `catch(...){ sink(x+7); }` see the correct arguments.
+///
+/// P2-5 fix: Recursively process catch handler bodies to reconstruct nested
+/// try blocks within catch handlers.
 fn build_catch_handlers(
     try_block: &TryBlockInfo,
     cfg: &ControlFlowGraph,
     landing_pad_bodies: &std::collections::HashMap<hexray_core::BasicBlockId, Vec<StructuredNode>>,
 ) -> Vec<structurer::CatchHandler> {
-    let mut handlers = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for h in &try_block.handlers {
-        // A cleanup entry unwinds destructors; it is not a source-level catch.
-        if !h.is_catch_all && h.catch_type.as_deref() == Some("cleanup") {
-            continue;
-        }
-        if !seen.insert(h.landing_pad) {
-            continue;
-        }
-        let body = cfg
-            .block_containing(h.landing_pad)
-            .and_then(|lp| landing_pad_bodies.get(&lp.id))
+    // Collect all non-cleanup handlers for this try block
+    let handlers: Vec<&CatchInfo> = try_block
+        .handlers
+        .iter()
+        .filter(|h| {
+            // A cleanup entry unwinds destructors; it is not a source-level catch.
+            !h.is_catch_all && h.catch_type.as_deref() != Some("cleanup")
+        })
+        .collect();
+
+    if handlers.is_empty() {
+        return Vec::new();
+    }
+
+    // Group handlers by landing pad to handle multiple catches at the same pad.
+    // In the Itanium ABI, multiple catch clauses can share one landing pad with
+    // a type selector dispatch.
+    let mut handlers_by_lp: std::collections::HashMap<u64, Vec<&CatchInfo>> = std::collections::HashMap::new();
+    for h in &handlers {
+        handlers_by_lp.entry(h.landing_pad).or_default().push(h);
+    }
+
+    let mut result = Vec::new();
+    for lp in handlers_by_lp.keys().copied() {
+        let handlers_at_lp = handlers_by_lp.get(&lp).unwrap();
+
+        // Get the structured body for this landing pad
+        let mut body = cfg
+            .block_containing(lp)
+            .and_then(|lp_block| landing_pad_bodies.get(&lp_block.id))
             .cloned()
             .unwrap_or_default();
-        handlers.push(structurer::CatchHandler {
-            exception_type: if h.is_catch_all {
-                None
-            } else {
-                h.catch_type.clone()
-            },
-            variable_name: Some("e".to_string()),
-            body,
-            landing_pad: h.landing_pad,
-        });
+
+        // P1-2: Propagate call args in the handler body before attaching.
+        body = structurer::propagate_call_args(body);
+
+        // P2-5: Recursively process catch handler bodies for nested try blocks.
+        // This handles the case where a catch handler contains a nested try block
+        // that wasn't converted to TryCatch during the initial structuring.
+        body = process_catch_handler_body(body, try_block, cfg, landing_pad_bodies);
+
+        // Extract catch bodies from the selector dispatch pattern
+        let mut catch_bodies = extract_catch_bodies_from_selector_dispatch(body, handlers_at_lp);
+
+        // Update exception_type for each catch body based on the original handler
+        for (i, catch_body) in catch_bodies.iter_mut().enumerate() {
+            if i < handlers_at_lp.len() {
+                catch_body.exception_type = if handlers_at_lp[i].is_catch_all {
+                    None
+                } else {
+                    handlers_at_lp[i].catch_type.clone()
+                };
+                catch_body.landing_pad = handlers_at_lp[i].landing_pad;
+            }
+        }
+
+        result.extend(catch_bodies);
     }
-    handlers
+
+    result
 }
 
 /// All basic-block ids appearing anywhere inside a structured node.
@@ -3035,17 +3902,27 @@ fn is_eh_scaffolding_runtime_name(name: &str) -> bool {
     )
 }
 
-/// Whether `name` is a raw x86-64 general-purpose register (any width). Used to
-/// recognise the compiler's type-selector temporary — a register never carries a
+/// Whether `name` is a raw general-purpose register (any width) for any architecture.
+/// Used to recognise the compiler's type-selector temporary — a register never carries a
 /// user variable at this stage, so gating the selector-`if` unwrap on one avoids
 /// mistaking a real `if (x == N)` in a handler for the type dispatch.
+/// P2-6 fix: Architecture-aware - includes x86-64, aarch64, and RISC-V registers.
 fn is_raw_register_name(name: &str) -> bool {
     matches!(
+        // x86-64
         name,
         "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp"
             | "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi"
             | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
             | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d"
+            // aarch64 (x0-x30, sp)
+            | "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7"
+            | "x8" | "x9" | "x10" | "x11" | "x12" | "x13" | "x14" | "x15"
+            | "x16" | "x17" | "x18" | "x19" | "x20" | "x21" | "x22" | "x23"
+            | "x24" | "x25" | "x26" | "x27" | "x28" | "x29" | "x30"
+            | "sp" | "xsp"
+            // RISC-V (a0-a7 are argument registers, commonly used as selector)
+            | "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7"
     )
 }
 
@@ -3233,8 +4110,99 @@ where
     cleaned
 }
 
+/// Check if an expression uses a specific variable.
+fn expr_uses_var(expr: &Expr, var_name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Var(v) => v.name == var_name,
+        ExprKind::IntLit(_) => false,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_uses_var(left, var_name) || expr_uses_var(right, var_name)
+        }
+        ExprKind::UnaryOp { operand, .. } => expr_uses_var(operand, var_name),
+        ExprKind::Deref { addr, .. } => expr_uses_var(addr, var_name),
+        ExprKind::GotRef { display_expr, .. } => expr_uses_var(display_expr, var_name),
+        ExprKind::AddressOf(e) => expr_uses_var(e, var_name),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_uses_var(base, var_name) || expr_uses_var(index, var_name)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_uses_var(base, var_name),
+        ExprKind::Call { args, .. } => args.iter().any(|a| expr_uses_var(a, var_name)),
+        ExprKind::Assign { lhs, rhs } => {
+            expr_uses_var(lhs, var_name) || expr_uses_var(rhs, var_name)
+        }
+        ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            expr_uses_var(lhs, var_name) || expr_uses_var(rhs, var_name)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_uses_var(cond, var_name)
+                || expr_uses_var(then_expr, var_name)
+                || expr_uses_var(else_expr, var_name)
+        }
+        ExprKind::Cast { expr, .. } => expr_uses_var(expr, var_name),
+        ExprKind::BitField { expr, .. } => expr_uses_var(expr, var_name),
+        ExprKind::Phi(_) => false,
+        ExprKind::Unknown(_) => false,
+    }
+}
+
+/// Check if any node in the list uses a specific variable.
+fn nodes_use_var(nodes: &[StructuredNode], var_name: &str) -> bool {
+    for node in nodes {
+        if node_uses_var(node, var_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn node_uses_var(node: &StructuredNode, var_name: &str) -> bool {
+    match node {
+        StructuredNode::Expr(e) => expr_uses_var(e, var_name),
+        StructuredNode::Block { statements, .. } => {
+            statements.iter().any(|s| expr_uses_var(s, var_name))
+        }
+        StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(|n| node_uses_var(n, var_name))
+                || else_body
+                    .as_ref()
+                    .map_or(false, |e| e.iter().any(|n| node_uses_var(n, var_name)))
+        }
+        StructuredNode::While { body, .. }
+        | StructuredNode::DoWhile { body, .. }
+        | StructuredNode::For { body, .. }
+        | StructuredNode::Loop { body, .. } => body.iter().any(|n| node_uses_var(n, var_name)),
+        StructuredNode::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, b)| b.iter().any(|n| node_uses_var(n, var_name)))
+                || default
+                    .as_ref()
+                    .map_or(false, |d| d.iter().any(|n| node_uses_var(n, var_name)))
+        }
+        StructuredNode::Sequence(inner) => inner.iter().any(|n| node_uses_var(n, var_name)),
+        StructuredNode::TryCatch { try_body, .. } => {
+            try_body.iter().any(|n| node_uses_var(n, var_name))
+        }
+        StructuredNode::Label(_) | StructuredNode::Goto(_) | StructuredNode::Break => false,
+        StructuredNode::Continue => false,
+        StructuredNode::Return(r) => r.as_ref().map_or(false, |r| expr_uses_var(r, var_name)),
+    }
+}
+
 /// Drop pure EH scaffolding-call statements from a node list, recursing into
 /// nested structural nodes and `Block` statement lists.
+///
+/// P1-3 fix: Only drop scaffolding calls when the assigned variable is not used
+/// elsewhere in the body. If the caught exception variable is used (e.g., `e.field`),
+/// the `__cxa_begin_catch` assignment must be preserved.
 fn drop_scaffolding_calls<F>(body: Vec<StructuredNode>, resolve: &F) -> Vec<StructuredNode>
 where
     F: Fn(u64, u64) -> Option<String>,
@@ -3242,6 +4210,37 @@ where
     let is_scaffold = |e: &Expr| {
         statement_call_name(e, resolve).is_some_and(|n| is_eh_scaffolding_runtime_name(&n))
     };
+
+    // Collect variable names from scaffolding assignments for use in P1-3 fix
+    let _scaffold_assignments: std::collections::HashSet<String> = body
+        .iter()
+        .filter_map(|node| {
+            if let StructuredNode::Expr(e) = node {
+                if let ExprKind::Assign { lhs, rhs, .. } = &e.kind {
+                    if let ExprKind::Var(v) = &lhs.kind {
+                        if let ExprKind::Call { target, .. } = &rhs.kind {
+                            let call_name = match target {
+                                expression::CallTarget::Named(n) => Some(n.clone()),
+                                expression::CallTarget::Direct { target, call_site } => {
+                                    resolve(*target, *call_site)
+                                }
+                                expression::CallTarget::Indirect(_)
+                                | expression::CallTarget::IndirectGot { .. } => None,
+                            };
+                            if call_name
+                                .as_ref()
+                                .is_some_and(|n| is_eh_scaffolding_runtime_name(n))
+                            {
+                                return Some(v.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
     let mut out = Vec::with_capacity(body.len());
     for node in body {
         match node {
@@ -3252,17 +4251,55 @@ where
             }
             StructuredNode::Block {
                 id,
-                mut statements,
+                statements,
                 address_range,
             } => {
-                statements.retain(|s| !is_scaffold(s));
+                let mut filtered = Vec::new();
+                for i in 0..statements.len() {
+                    let s = &statements[i];
+                    // Check if this is a scaffolding call that assigns a variable used elsewhere
+                    if let ExprKind::Assign { lhs, rhs, .. } = &s.kind {
+                        if let ExprKind::Var(v) = &lhs.kind {
+                            if let ExprKind::Call { target, .. } = &rhs.kind {
+                                let call_name = match target {
+                                    expression::CallTarget::Named(n) => Some(n.clone()),
+                                    expression::CallTarget::Direct { target, call_site } => {
+                                        resolve(*target, *call_site)
+                                    }
+                                    expression::CallTarget::Indirect(_)
+                                    | expression::CallTarget::IndirectGot { .. } => None,
+                                };
+                                if call_name
+                                    .as_ref()
+                                    .is_some_and(|n| is_eh_scaffolding_runtime_name(n))
+                                {
+                                    // This is an EH scaffolding call assigning to v.name
+                                    // Only drop it if v.name is not used elsewhere in:
+                                    // 1. The remaining statements in this block (after current)
+                                    // 2. The output so far (previous statements)
+                                    let remaining_uses: Vec<Expr> = statements
+                                        .iter()
+                                        .skip(i + 1) // Skip current and previous statements
+                                        .cloned()
+                                        .collect();
+                                    if !remaining_uses.iter().any(|e| expr_uses_var(e, &v.name))
+                                        && !nodes_use_var(&out, &v.name)
+                                    {
+                                        continue; // Skip this scaffolding call
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    filtered.push(s.clone());
+                }
                 // Drop a block that held only scaffolding (e.g. the `_Unwind_Resume`
                 // tail) so it does not sit between the handler and the end of the
                 // catch body and block the selector-`if` unwrap.
-                if !statements.is_empty() {
+                if !filtered.is_empty() {
                     out.push(StructuredNode::Block {
                         id,
-                        statements,
+                        statements: filtered,
                         address_range,
                     });
                 }
