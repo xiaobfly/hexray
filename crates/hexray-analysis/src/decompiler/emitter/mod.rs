@@ -5958,9 +5958,9 @@ impl PseudoCodeEmitter {
     /// receiver's type) from being mis-sugared into `v.get<…>()`.
     ///
     /// First slice: named methods (`o.has_value()`, `v.index()`, …),
-    /// `operator*` → `*o`, and `operator bool` → `(bool)o`. Other operators
-    /// (`operator=`, `operator->`, `operator[]`, …) are left in qualified form
-    /// for a follow-up.
+    /// `operator*` → `*o`, and `operator bool` → `(bool)o`.
+    /// Follow-up: `operator[]` → `o[idx]`, `operator->` → `o`, `operator=` → `o = val`.
+    /// These require rhs value recovery for assignment (stack-temp addresses).
     fn try_format_optional_variant_method_sugar(
         &self,
         target_name: &str,
@@ -6020,7 +6020,31 @@ impl PseudoCodeEmitter {
         if method == "operator bool" {
             return Some(format!("(bool){recv_str}"));
         }
-        // operator= / -> / [] / == … left in qualified form for a follow-up.
+        // C++ optional/variant operator sugar.
+        // operator[] - index access: `o[idx]`
+        if method == "operator[]" {
+            // The receiver is `&recv`, args[0] is the index
+            if let Some(idx_arg) = args.get(0) {
+                let idx_str = self.format_expr_with_strings(idx_arg, table);
+                return Some(format!("{recv_str}[{idx_str}]"));
+            }
+        }
+        // operator-> - member access: `o->member`
+        // For `std::optional`/`std::variant`, `operator->` returns `*this`, so we
+        // just return `recv` directly (the chaining is handled at the call site).
+        if method == "operator->" {
+            return Some(recv_str);
+        }
+        // operator= - assignment: `o = value`
+        // The rhs is typically after skipping `&this`, so args[0] is the value.
+        // Note: this requires rhs value recovery (not yet fully implemented for all cases).
+        if method == "operator=" {
+            if let Some(rhs_arg) = args.get(0) {
+                let rhs_str = self.format_expr_with_strings(rhs_arg, table);
+                return Some(format!("{recv_str} = {rhs_str}"));
+            }
+        }
+        // Other operators left in qualified form for future work.
         if method.starts_with("operator") {
             return None;
         }
