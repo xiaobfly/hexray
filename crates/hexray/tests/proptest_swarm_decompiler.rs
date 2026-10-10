@@ -18,11 +18,15 @@
 //!  - Output must have balanced braces (structurally valid).
 //!  - Output must be deterministic (same config + same input → same output).
 //!
-//! Each proptest case is a random `u32` bitmask selecting which of the 24
-//! optimization passes are enabled.  With 50 % per-pass probability the swarm
-//! set naturally covers a wide variety of configurations (a 100-element swarm
-//! is 95 % likely to contain at least one C_i with any given set of five
-//! features, per the paper's analysis).
+//! Each proptest case selects which of the 24 optimization passes are enabled.
+//! We deliberately do *not* draw a uniform `any::<u32>()` bitmask: that makes the
+//! number of enabled passes a `Binomial(24, 0.5)`, concentrated so tightly around
+//! 12 that the extreme shapes (the full production pipeline, and near-isolated
+//! single passes) are never generated.  Instead [`arb_swarm_bits`] picks a
+//! *density bucket* with explicit relative-integer weights and fills a bitmask at
+//! that density, so the classic 50/50 swarm stays the common case while the tails
+//! are exercised on a regular basis.  See that function and the
+//! "when random isn't random enough" note beside it for the rationale.
 
 use proptest::prelude::*;
 
@@ -201,6 +205,78 @@ fn braces_well_formed(code: &str) -> bool {
 }
 
 // =============================================================================
+// Swarm Configuration Strategy — weighted density, not uniform bitmasks
+// =============================================================================
+//
+// The obvious swarm generator is `bits in any::<u32>()`: every pass is included
+// independently with probability 1/2.  That sounds diverse, but it is a textbook
+// case of *picking the wrong distribution* (see
+// <https://ersc.io/blog/when-random-isnt-random-enough>): a uniform-over-bitmasks
+// sampler makes the **number** of enabled passes a `Binomial(N, 0.5)`.  With the
+// decompiler's N = 24 passes the count concentrates hard around 12
+// (σ = √(24·0.25) ≈ 2.45), so in practice *every* generated configuration enables
+// 7–17 passes.  The two most interesting shapes are then never produced:
+//
+//   * the **full production pipeline** (all passes on) — P ≈ 1/2²⁴ per draw, so
+//     unseen across any realistic case budget; yet this is the config users
+//     actually run, and the one where passes interact most; and
+//   * **near-isolated** configs (0–3 passes) that let a single pass run almost
+//     alone — exactly where a pass that normally hides behind an upstream pass
+//     gets to expose its own bugs (the whole point of feature-omission swarms).
+//
+// Rather than sample bitmasks and hope the tails show up, we express the desired
+// distribution directly, with relative integer weights (small, auditable, and
+// obviously lopsided-or-not at a glance — the blog's core recommendation).  We
+// pick a *density bucket* first, then fill a bitmask at that density.  This keeps
+// the classic 50/50 swarm as the plurality case while guaranteeing the extremes
+// are exercised on a regular basis.
+
+/// Number of optimization passes the swarm ranges over.
+fn num_passes() -> usize {
+    hexray_analysis::OptimizationPass::all().len()
+}
+
+/// Bitmask with every pass enabled (the full production pipeline).
+fn all_passes_mask() -> u32 {
+    let n = num_passes();
+    if n >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << n) - 1
+    }
+}
+
+/// A swarm bitmask in which each pass is independently enabled with probability
+/// `p`.  Used to realise a chosen density bucket.
+fn bits_at_density(p: f64) -> impl Strategy<Value = u32> {
+    proptest::collection::vec(proptest::bool::weighted(p), num_passes()).prop_map(|flags| {
+        flags
+            .iter()
+            .enumerate()
+            .filter(|&(_, &on)| on)
+            .fold(0u32, |mask, (i, _)| mask | (1u32 << i))
+    })
+}
+
+/// Weighted-density swarm-configuration strategy.
+///
+/// The weights are relative integers (1:3:4:3:1, summing to 12).  Read off the
+/// intent at a glance: the 50/50 swarm is the plurality (4/12), the two "near"
+/// tails are well represented (3/12 each), and the hard extremes — empty and
+/// full — each get a steady 1/12 so they are *guaranteed* to appear, unlike with
+/// a uniform bitmask where they never do.
+fn arb_swarm_bits() -> impl Strategy<Value = u32> {
+    let full = all_passes_mask();
+    prop_oneof![
+        1 => Just(0u32),            // all passes OFF — raw structuring baseline
+        3 => bits_at_density(0.12), // near-isolated: typically 1–3 passes active
+        4 => bits_at_density(0.5),  // the classic Groce 50/50 swarm
+        3 => bits_at_density(0.88), // near-complete: one or two passes omitted
+        1 => Just(full),            // full production pipeline — all passes ON
+    ]
+}
+
+// =============================================================================
 // Swarm Testing Properties
 // =============================================================================
 
@@ -214,7 +290,7 @@ proptest! {
     /// each `bits` value is a random test configuration C_i where each
     /// of the 24 passes has ~50% probability of inclusion.
     #[test]
-    fn swarm_decompile_never_crashes(bits in any::<u32>()) {
+    fn swarm_decompile_never_crashes(bits in arb_swarm_bits()) {
         let config = DecompilerConfig::from_swarm_bits(bits);
 
         for (name, bytes, start) in test_programs() {
@@ -248,7 +324,7 @@ proptest! {
     /// Determinism: the same swarm configuration and input must always
     /// produce identical output.
     #[test]
-    fn swarm_decompile_is_deterministic(bits in any::<u32>()) {
+    fn swarm_decompile_is_deterministic(bits in arb_swarm_bits()) {
         for (name, bytes, start) in test_programs() {
             let config1 = DecompilerConfig::from_swarm_bits(bits);
             let config2 = DecompilerConfig::from_swarm_bits(bits);
@@ -270,7 +346,7 @@ proptest! {
     /// the subset and the superset must produce non-empty results.)
     #[test]
     fn swarm_superset_still_produces_output(
-        base_bits in any::<u32>(),
+        base_bits in arb_swarm_bits(),
         extra_bits in any::<u32>(),
     ) {
         let subset_bits = base_bits;
@@ -308,7 +384,7 @@ proptest! {
     /// most complex pass interactions (register aliasing, dead-store
     /// elimination, copy propagation, for-loop detection).
     #[test]
-    fn swarm_loop_program_robust(bits in any::<u32>()) {
+    fn swarm_loop_program_robust(bits in arb_swarm_bits()) {
         let config = DecompilerConfig::from_swarm_bits(bits);
         let code = decompile_with_config(LOOP_BYTES, 0x1000, "sum_loop", config.clone());
 
@@ -392,7 +468,7 @@ mod system_binary_swarm {
         /// This exercises the decompiler on production machine code with
         /// diverse pass configurations.
         #[test]
-        fn swarm_system_binary(bits in any::<u32>()) {
+        fn swarm_system_binary(bits in arb_swarm_bits()) {
             if let Some((arch, bytes, addr, name)) = extract_function("/bin/ls") {
                 let instructions = match arch {
                     Architecture::X86_64 => disassemble_x86(&bytes, addr),
@@ -426,6 +502,52 @@ mod system_binary_swarm {
             }
         }
     }
+}
+
+// =============================================================================
+// Strategy self-check — the weighted swarm actually reaches the tails
+// =============================================================================
+
+/// Guards the whole point of [`arb_swarm_bits`]: that it reliably produces the
+/// distribution tails a uniform `any::<u32>()` bitmask provably starves.
+///
+/// We sample the strategy deterministically and assert that, within a modest
+/// budget, we see the all-off config, the full pipeline, a near-isolated config
+/// (1–4 passes), and a near-complete one (all but 1–4 passes).  A uniform
+/// bitmask would (essentially) never hit the first two: P(all-on) = P(all-off)
+/// = 1/2²⁴ per draw, i.e. ~1e-4 expected occurrences across these 4 000 draws.
+#[test]
+fn weighted_swarm_reaches_distribution_tails() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::deterministic();
+    let strat = arb_swarm_bits();
+    let n = num_passes() as u32;
+    let full = all_passes_mask();
+
+    let (mut saw_empty, mut saw_full, mut saw_sparse, mut saw_dense) =
+        (false, false, false, false);
+
+    for _ in 0..4000 {
+        let bits = strat.new_tree(&mut runner).unwrap().current();
+        let k = bits.count_ones();
+        saw_empty |= bits == 0;
+        saw_full |= bits == full;
+        saw_sparse |= (1..=4).contains(&k);
+        saw_dense |= k < n && k >= n.saturating_sub(4);
+    }
+
+    assert!(saw_empty, "weighted swarm never produced the all-off config");
+    assert!(saw_full, "weighted swarm never produced the full pipeline");
+    assert!(
+        saw_sparse,
+        "weighted swarm never produced a near-isolated config (1-4 passes)"
+    );
+    assert!(
+        saw_dense,
+        "weighted swarm never produced a near-complete config"
+    );
 }
 
 // =============================================================================

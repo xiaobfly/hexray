@@ -86,7 +86,11 @@ fn elf_parse_survives_random_bit_flips() {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let pos = (state as usize) % seed.len();
+        // Map the PRNG word onto a byte index without the modulo bias that
+        // `state % seed.len()` would introduce when 2⁶⁴ isn't a multiple of the
+        // length (see https://ersc.io/blog/when-random-isnt-random-enough).
+        // Lemire's multiply-high maps [0, 2⁶⁴) onto [0, len) near-uniformly.
+        let pos = ((state as u128 * seed.len() as u128) >> 64) as usize;
         let bit = (state.rotate_right(33) as u8) & 0x7;
         let mut mutated = seed.clone();
         mutated[pos] ^= 1 << bit;
