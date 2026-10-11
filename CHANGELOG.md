@@ -5,6 +5,52 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.19] - 2026-10-11
+
+### Decompiler — C++ exception-handling catch-body recovery
+
+- **Populated catch bodies from the LSDA.** Recover `try` / `catch` structure with
+  real handler bodies instead of empty stubs, driven by the landing-pad and
+  type-info tables.
+- **Shared landing-pad splitting (P1-1).** Parse the selector dispatch
+  (`if (reg == N)`) so a single landing pad shared by multiple `catch` clauses is
+  split back into one handler per caught type.
+- **Catch-body call-argument propagation (P1-2).** Run argument propagation over
+  landing-pad bodies before attaching them, so calls inside a handler render with
+  their arguments.
+- **Caught-object value preservation (P1-3).** Keep the scaffolding call that
+  materializes the caught object when its value is subsequently used.
+- **Over-broad `try` scope splitting (P1-4).** Descend into compound nodes that
+  are only partially protected and wrap the protected sub-range, rather than
+  over-scoping the whole block.
+- **Nested `try` in a catch body (P2-5).** Recursively apply EH reconstruction to
+  handler bodies so a `try` nested inside a `catch` is recovered too.
+- **Architecture-aware selector registers (P2-6).** Detect the selector/result
+  registers per target (x86-64 `rax`/`rdx`, AArch64 `x0`/`x1`, RISC-V `a0`/`a1`).
+- **Readable RTTI catch-type names.** Replace `type@0xNNN` with the demangled
+  type (e.g. `std::runtime_error`) by resolving the `_ZTI*` type-info symbol.
+- **Collapse class throws whose constructor return is captured.** Recognize the
+  `-O0` shape where `throw std::runtime_error("boom")` emits a captured
+  `ret_N = Class::Class(buf, args)` between `__cxa_allocate_exception` and
+  `__cxa_throw`, and render it back as the direct `throw`.
+
+### Decompiler — C++ `std::optional` / `std::variant`
+
+- **Member operator sugar.** Render `operator[]` as `o[idx]`, `operator->` as
+  `o`, and `operator=` as `o = rhs` (including `operator=<T>` with template
+  arguments).
+
+### Testing (internal — no behavior change)
+
+- **Weighted-density swarm configurations.** The decompiler swarm proptest now
+  draws pass subsets from an explicit weighted density distribution instead of a
+  uniform `u32` bitmask, which had made the enabled-pass count a
+  `Binomial(24, 0.5)` that never produced the full-pipeline or near-isolated
+  configurations. A self-check asserts the tails are reached. Validated with a
+  20-million-case soak across the swarm properties (no regressions found).
+- **Remove modulo bias in the CUDA bit-flip fuzzer.** Replace `state % len` byte
+  selection with Lemire's multiply-high map.
+
 ## [1.3.18] - 2026-07-18
 
 ### Decompiler — clang C++20 coroutine `.resume` recovery
