@@ -706,6 +706,7 @@ fn decompile_guarded(
     label: &str,
     config: DecompilerConfig,
 ) -> String {
+    use std::sync::mpsc::RecvTimeoutError;
     let (tx, rx) = std::sync::mpsc::channel();
     let cfg = config.clone();
     std::thread::spawn(move || {
@@ -713,13 +714,24 @@ fn decompile_guarded(
     });
     match rx.recv_timeout(timeout) {
         Ok(code) => code,
-        Err(_) => {
+        // A real hang: the worker is still running and Rust cannot kill it, so
+        // fail hard and contained.
+        Err(RecvTimeoutError::Timeout) => {
             eprintln!(
                 "BOUNDED-RESOURCE HANG: fixture '{name}' ({label}) did not finish within \
                  {timeout:?} — possible infinite loop / superlinear blowup\nconfig: {}",
                 config.describe()
             );
             std::process::abort();
+        }
+        // The worker panicked before sending (tx dropped): NOT a hang — there is
+        // no stuck thread.  Propagate as a normal panic so proptest reports and
+        // shrinks it instead of aborting the whole process and masking the bug.
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!(
+                "decompile worker panicked for fixture '{name}' ({label})\nconfig: {}",
+                config.describe()
+            );
         }
     }
 }
