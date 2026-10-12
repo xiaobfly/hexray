@@ -99,11 +99,11 @@ fn push_uleb(out: &mut Vec<u8>, mut value: u64) {
 /// handled specially (string / udata / sdata).
 fn fixed_form_len(form: u64, addr_size: usize) -> Option<usize> {
     Some(match form {
-        0x01 => addr_size,          // addr
-        0x0b | 0x0c => 1,           // data1, flag
-        0x05 => 2,                  // data2
+        0x01 => addr_size,              // addr
+        0x0b | 0x0c => 1,               // data1, flag
+        0x05 => 2,                      // data2
         0x06 | 0x0e | 0x13 | 0x17 => 4, // data4, strp, ref4, sec_offset
-        0x07 => 8,                  // data8
+        0x07 => 8,                      // data8
         _ => return None,
     })
 }
@@ -126,21 +126,40 @@ impl<'a> PoolCursor<'a> {
     }
 }
 
+// Caps so the *harness* itself can never OOM/hang before reaching the parser:
+// without them a crafted input (one abbrev with N attrs × M DIEs selecting it)
+// expands multiplicatively. Output bytes are bounded by
+// MAX_DIES × MAX_ATTRS_PER_ABBREV × max-form-size, a few KiB.
+const MAX_ABBREVS: usize = 16;
+const MAX_ATTRS_PER_ABBREV: usize = 16;
+const MAX_DIES: usize = 64;
+const MAX_VALUE_POOL: usize = 64;
+
 impl FuzzedDwarf {
     fn build(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let addr_size = if self.addr64 { 8 } else { 4 };
 
-        // Always have at least one abbrev so DIEs have something to reference.
-        let n_abbrev = self.abbrevs.len().max(1);
+        // Bounded view of the fuzzer-chosen abbreviations.
+        let abbrevs: Vec<&FuzzedAbbrev> = self.abbrevs.iter().take(MAX_ABBREVS).collect();
+        let n_abbrev = abbrevs.len().max(1);
 
         // --- .debug_abbrev ---------------------------------------------------
+        // Abbrev code 1 is ALWAYS the compilation-unit root with
+        // DW_CHILDREN_yes, so the generated child DIEs are reachable from the
+        // single root DIE that `parse_compilation_unit` actually walks. Every
+        // other abbrev is DW_CHILDREN_no, keeping the child list flat.
         let mut abbrev = Vec::new();
-        for (i, a) in self.abbrevs.iter().enumerate() {
+        for (i, a) in abbrevs.iter().enumerate() {
             let code = (i as u64) + 1;
             push_uleb(&mut abbrev, code);
-            push_uleb(&mut abbrev, TAGS[(a.tag_sel as usize) % TAGS.len()]);
-            abbrev.push(0); // DW_CHILDREN_no — keep the DIE stream flat/walkable
-            for sel in &a.attr_sels {
+            if i == 0 {
+                push_uleb(&mut abbrev, 0x11); // DW_TAG_compile_unit (root)
+                abbrev.push(1); // DW_CHILDREN_yes
+            } else {
+                push_uleb(&mut abbrev, TAGS[(a.tag_sel as usize) % TAGS.len()]);
+                abbrev.push(0); // DW_CHILDREN_no
+            }
+            for sel in a.attr_sels.iter().take(MAX_ATTRS_PER_ABBREV) {
                 let (at, form) = SPECS[(*sel as usize) % SPECS.len()];
                 push_uleb(&mut abbrev, at);
                 push_uleb(&mut abbrev, form);
@@ -148,66 +167,91 @@ impl FuzzedDwarf {
             push_uleb(&mut abbrev, 0); // end of attr specs
             push_uleb(&mut abbrev, 0);
         }
-        if self.abbrevs.is_empty() {
-            // Synthesize a trivial abbrev: code 1, base_type, no attrs.
+        if abbrevs.is_empty() {
+            // Synthesize the root abbrev: code 1, compile_unit, children=yes.
             push_uleb(&mut abbrev, 1);
-            push_uleb(&mut abbrev, 0x24);
-            abbrev.push(0);
+            push_uleb(&mut abbrev, 0x11);
+            abbrev.push(1);
             push_uleb(&mut abbrev, 0);
             push_uleb(&mut abbrev, 0);
         }
         abbrev.push(0); // end of abbrev table
 
-        // --- DIE stream ------------------------------------------------------
-        let mut dies = Vec::new();
-        for die in &self.dies {
-            let idx = (die.abbrev_sel as usize) % n_abbrev;
-            let code = (idx as u64) + 1;
-            push_uleb(&mut dies, code);
-
-            let specs: Vec<(u64, u64)> = match self.abbrevs.get(idx) {
-                Some(a) => a
-                    .attr_sels
-                    .iter()
-                    .map(|s| SPECS[(*s as usize) % SPECS.len()])
-                    .collect(),
-                None => Vec::new(),
-            };
-
-            let mut cursor = PoolCursor {
-                pool: &die.value_pool,
-                pos: 0,
-            };
+        // Emit one DIE's attribute values (form-correct lengths from `pool`).
+        let emit_die_values = |idx: usize, pool: &[u8], out: &mut Vec<u8>| {
+            let specs: Vec<(u64, u64)> = abbrevs
+                .get(idx)
+                .map(|a| {
+                    a.attr_sels
+                        .iter()
+                        .take(MAX_ATTRS_PER_ABBREV)
+                        .map(|s| SPECS[(*s as usize) % SPECS.len()])
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut cursor = PoolCursor { pool, pos: 0 };
             for (_at, form) in specs {
                 match fixed_form_len(form, addr_size) {
-                    Some(n) => cursor.take(n, &mut dies),
+                    Some(n) => cursor.take(n, out),
                     None => match form {
                         0x08 => {
                             // DW_FORM_string: short inline NUL-terminated string.
                             for _ in 0..4 {
                                 let b = cursor.next_byte();
-                                dies.push(if b == 0 { b'a' } else { b });
+                                out.push(if b == 0 { b'a' } else { b });
                             }
-                            dies.push(0);
+                            out.push(0);
                         }
-                        0x0f => push_uleb(&mut dies, (cursor.next_byte() & 0x7f) as u64), // udata
-                        0x0d => dies.push(cursor.next_byte() & 0x3f), // sdata, single positive byte
+                        0x0f => push_uleb(out, (cursor.next_byte() & 0x7f) as u64), // udata
+                        0x0d => out.push(cursor.next_byte() & 0x3f), // sdata (positive)
                         _ => {}
                     },
                 }
             }
-        }
-        dies.push(0); // trailing null DIE
+        };
 
-        // --- .debug_info CU header (32-bit DWARF) ----------------------------
+        // --- DIE stream: one compile_unit root, the rest as its children -----
+        let mut dies = Vec::new();
+        push_uleb(&mut dies, 1); // root uses abbrev code 1
+        let empty = Vec::new();
+        let root_pool = self.dies.first().map(|d| &d.value_pool).unwrap_or(&empty);
+        emit_die_values(0, root_pool, &mut dies);
+        // Children are only expressible when a non-root (children=no) abbrev
+        // exists; otherwise every abbrev code would reopen a child list.
+        if n_abbrev >= 2 {
+            for die in self.dies.iter().skip(1).take(MAX_DIES) {
+                let child_idx = 1 + (die.abbrev_sel as usize) % (n_abbrev - 1); // [1, n_abbrev-1]
+                push_uleb(&mut dies, (child_idx as u64) + 1); // code in [2, n_abbrev]
+                let pool: Vec<u8> = die
+                    .value_pool
+                    .iter()
+                    .take(MAX_VALUE_POOL)
+                    .copied()
+                    .collect();
+                emit_die_values(child_idx, &pool, &mut dies);
+            }
+        }
+        push_uleb(&mut dies, 0); // end of the root's children
+
+        // --- .debug_info CU header (32-bit DWARF), version-correct layout ----
         let version = 2 + (self.version_sel % 4) as u16; // 2..=5
+        let mut body = Vec::new();
+        body.extend_from_slice(&version.to_le_bytes());
+        if version >= 5 {
+            // DWARF 5: version, unit_type, address_size, debug_abbrev_offset.
+            body.push(0x01); // DW_UT_compile
+            body.push(addr_size as u8);
+            body.extend_from_slice(&0u32.to_le_bytes()); // debug_abbrev_offset
+        } else {
+            // DWARF 2–4: version, debug_abbrev_offset, address_size.
+            body.extend_from_slice(&0u32.to_le_bytes()); // debug_abbrev_offset
+            body.push(addr_size as u8);
+        }
+        body.extend_from_slice(&dies);
+
         let mut info = Vec::new();
-        let unit_length = (2 + 4 + 1 + dies.len()) as u32; // version + abbrev_off + addr_size + DIEs
-        info.extend_from_slice(&unit_length.to_le_bytes());
-        info.extend_from_slice(&version.to_le_bytes());
-        info.extend_from_slice(&0u32.to_le_bytes()); // debug_abbrev_offset
-        info.push(addr_size as u8);
-        info.extend_from_slice(&dies);
+        info.extend_from_slice(&(body.len() as u32).to_le_bytes()); // unit_length
+        info.extend_from_slice(&body);
         info.extend_from_slice(&self.extra);
 
         (info, abbrev, self.debug_str.clone())
