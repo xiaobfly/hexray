@@ -105,6 +105,9 @@ fn name_path(demangled: &str) -> Option<Vec<String>> {
     let segments = split_top_level_scope(head);
     let mut path = Vec::with_capacity(segments.len());
     for seg in segments {
+        // A GNU ABI tag can sit either at the segment end (`foo[abi:x]`) or
+        // BEFORE a template list (`foo[abi:x]<int>`), so strip tags both before
+        // and after template removal.
         let seg = strip_abi_tags(&seg);
         // Symbolic operator names (`operator<`, `operator<=`, `operator()`, …)
         // must be recognized BEFORE template stripping: `strip_template_args`
@@ -116,10 +119,11 @@ fn name_path(demangled: &str) -> Option<Vec<String>> {
             return None;
         }
         let base = strip_template_args(seg);
+        let base = strip_abi_tags(&base); // tag that preceded a `<...>` list
         if base.is_empty() {
             return None;
         }
-        path.push(base);
+        path.push(base.to_string());
     }
     Some(path)
 }
@@ -432,6 +436,15 @@ mod unit {
         assert_eq!(
             name_path("Aa0AAA_[abi:_A_00a_AA_AAa0_AAAA0A_0AAaaA0a]"),
             Some(vec!["Aa0AAA_".to_string()])
+        );
+        // ABI tag BEFORE a template list (cpp_demangle renders `foo[abi:x]<int>`).
+        assert_eq!(
+            name_path("foo[abi:x]<int>()"),
+            Some(vec!["foo".to_string()])
+        );
+        assert_eq!(
+            name_path("ns::bar[abi:cxx11]<int, long>(int)"),
+            Some(vec!["ns".to_string(), "bar".to_string()])
         );
     }
 
