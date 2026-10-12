@@ -98,11 +98,14 @@ fn name_path(demangled: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    // Split on top-level "::" and strip each segment's template arguments.
+    // Split on top-level "::" and strip each segment's template arguments and
+    // GNU ABI tags.  The two demanglers disagree on ABI-tag *fidelity* — the
+    // bespoke parser drops `[abi:...]` while cpp_demangle renders it — so the
+    // projection normalizes it away rather than treating it as a name mismatch.
     let segments = split_top_level_scope(head);
     let mut path = Vec::with_capacity(segments.len());
     for seg in segments {
-        let base = strip_template_args(&seg);
+        let base = strip_template_args(strip_abi_tags(&seg));
         if base.is_empty() {
             return None;
         }
@@ -147,6 +150,24 @@ fn split_top_level_scope(head: &str) -> Vec<String> {
     }
     segments.push(head[start..].to_string());
     segments
+}
+
+/// Remove trailing GNU ABI-tag groups (`[abi:...]`) from a segment, e.g.
+/// `name[abi:cxx11]` → `name`, `name[abi:a][abi:b]` → `name`.  A `[` is only
+/// treated as an ABI tag when it is balanced and closes at the segment end, so a
+/// genuine `operator[]` (which `name_path` already declines via its top-level
+/// space check for most shapes) or stray bracket does not silently truncate.
+fn strip_abi_tags(segment: &str) -> &str {
+    let mut s = segment.trim_end();
+    while let Some(open) = s.rfind("[abi:") {
+        // Everything from `open` must be a single `[...]` closing at the end.
+        if s.ends_with(']') && !s[open + 1..s.len() - 1].contains('[') {
+            s = s[..open].trim_end();
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 /// Remove a trailing top-level `<...>` template argument list from one segment.
@@ -369,6 +390,22 @@ mod unit {
         // Return-type prefix or operator-with-space → declined (top-level space).
         assert_eq!(name_path("int foo(int)"), None);
         assert_eq!(name_path("operator new(unsigned long)"), None);
+    }
+
+    #[test]
+    fn name_path_strips_abi_tags() {
+        // GNU ABI tags differ in fidelity between the two demanglers; the
+        // projection must drop them so both sides compare equal.
+        assert_eq!(name_path("foo[abi:cxx11]()"), Some(vec!["foo".to_string()]));
+        assert_eq!(
+            name_path("ns::bar[abi:a][abi:b](int)"),
+            Some(vec!["ns".to_string(), "bar".to_string()])
+        );
+        // The exact counterexample codex found (seed 3).
+        assert_eq!(
+            name_path("Aa0AAA_[abi:_A_00a_AA_AAa0_AAAA0A_0AAaaA0a]"),
+            Some(vec!["Aa0AAA_".to_string()])
+        );
     }
 
     #[test]
