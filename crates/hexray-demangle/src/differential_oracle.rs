@@ -105,13 +105,40 @@ fn name_path(demangled: &str) -> Option<Vec<String>> {
     let segments = split_top_level_scope(head);
     let mut path = Vec::with_capacity(segments.len());
     for seg in segments {
-        let base = strip_template_args(strip_abi_tags(&seg));
+        let seg = strip_abi_tags(&seg);
+        // Symbolic operator names (`operator<`, `operator<=`, `operator()`, …)
+        // must be recognized BEFORE template stripping: `strip_template_args`
+        // would read the `<` in `operator<` as a template opener and collapse
+        // both `operator<` and `operator<=` to `operator`, masking a genuine
+        // operator-name disagreement.  They are declined as ambiguous (matching
+        // the projection's skip-when-unsure stance) rather than compared.
+        if is_operator_function(seg) {
+            return None;
+        }
+        let base = strip_template_args(seg);
         if base.is_empty() {
             return None;
         }
         path.push(base);
     }
     Some(path)
+}
+
+/// True when a segment is a C++ `operator` function name whose spelling cannot be
+/// safely template-stripped — exactly `operator`, or `operator` immediately
+/// followed by a non-identifier character (`operator<`, `operator<=`,
+/// `operator()`, `operator[]`, `operator+`, `operator""_x`, …).  A normal
+/// identifier that merely starts with "operator" (e.g. `operatorX`) is NOT
+/// flagged, and space-bearing forms (`operator new`, `operator int`) are already
+/// declined by `name_path`'s top-level-space check.
+fn is_operator_function(segment: &str) -> bool {
+    let Some(rest) = segment.strip_prefix("operator") else {
+        return false;
+    };
+    match rest.chars().next() {
+        None => true, // exactly "operator"
+        Some(c) => !(c.is_ascii_alphanumeric() || c == '_'),
+    }
 }
 
 fn has_top_level_space(s: &str) -> bool {
@@ -405,6 +432,23 @@ mod unit {
         assert_eq!(
             name_path("Aa0AAA_[abi:_A_00a_AA_AAa0_AAAA0A_0AAaaA0a]"),
             Some(vec!["Aa0AAA_".to_string()])
+        );
+    }
+
+    #[test]
+    fn name_path_declines_symbolic_operators() {
+        // `<` in the operator spelling must NOT be read as a template opener;
+        // these are declined so `operator<` vs `operator<=` can never be
+        // silently equated.
+        assert_eq!(name_path("operator<(int)"), None);
+        assert_eq!(name_path("operator<=(int)"), None);
+        assert_eq!(name_path("ns::operator==(int)"), None);
+        assert_eq!(name_path("operator()(int)"), None);
+        assert_eq!(name_path("operator[](int)"), None);
+        // A normal identifier that merely starts with "operator" is unaffected.
+        assert_eq!(
+            name_path("operatorX(int)"),
+            Some(vec!["operatorX".to_string()])
         );
     }
 
