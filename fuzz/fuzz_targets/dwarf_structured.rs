@@ -76,7 +76,6 @@ struct FuzzedDwarf {
     abbrevs: Vec<FuzzedAbbrev>,
     dies: Vec<FuzzedDie>,
     debug_str: Vec<u8>,
-    extra: Vec<u8>,
 }
 
 /// Minimal unsigned-LEB128 encoder (all values here are small, but keep it
@@ -249,10 +248,15 @@ impl FuzzedDwarf {
         }
         body.extend_from_slice(&dies);
 
+        // Exactly one CU, with no trailing bytes: `unit_length` covers the whole
+        // section, so `parse_all()` returns Ok and `exercise` builds the
+        // `DebugInfo` that drives the deep accessors. (A trailer past
+        // `unit_length` would make the parser reject the section as garbage after
+        // the valid CU, skipping the very code this target exists to reach. The
+        // raw-bytes path still fuzzes arbitrary/trailing content.)
         let mut info = Vec::new();
         info.extend_from_slice(&(body.len() as u32).to_le_bytes()); // unit_length
         info.extend_from_slice(&body);
-        info.extend_from_slice(&self.extra);
 
         (info, abbrev, self.debug_str.clone())
     }
