@@ -526,8 +526,7 @@ fn weighted_swarm_reaches_distribution_tails() {
     let n = num_passes() as u32;
     let full = all_passes_mask();
 
-    let (mut saw_empty, mut saw_full, mut saw_sparse, mut saw_dense) =
-        (false, false, false, false);
+    let (mut saw_empty, mut saw_full, mut saw_sparse, mut saw_dense) = (false, false, false, false);
 
     for _ in 0..4000 {
         let bits = strat.new_tree(&mut runner).unwrap().current();
@@ -538,7 +537,10 @@ fn weighted_swarm_reaches_distribution_tails() {
         saw_dense |= k < n && k >= n.saturating_sub(4);
     }
 
-    assert!(saw_empty, "weighted swarm never produced the all-off config");
+    assert!(
+        saw_empty,
+        "weighted swarm never produced the all-off config"
+    );
     assert!(saw_full, "weighted swarm never produced the full pipeline");
     assert!(
         saw_sparse,
@@ -548,6 +550,128 @@ fn weighted_swarm_reaches_distribution_tails() {
         saw_dense,
         "weighted swarm never produced a near-complete config"
     );
+}
+
+// =============================================================================
+// Reachability witness — the swarm properties are not vacuous
+// =============================================================================
+//
+// Bug Bash 2026 playbook §3: a safety property ("never panics", "balanced
+// braces", "deterministic") passes trivially on a decompiler that only ever
+// emitted `return 0;`.  A *witness* turns "the properties hold" into "the
+// properties hold **and** the inputs actually reach the interesting states",
+// by proving the generated swarm configs drive the decompiler through its deep
+// control-flow recovery.  Without this, a regression that silently narrowed the
+// fixtures (or neutered structuring) would leave every property green while
+// testing nothing.
+//
+// We assert only on states these fixtures *guarantee* are reachable — structured
+// loops and conditionals (see `swarm_coverage_report`, which measures 100% loop
+// recovery for the loop fixture).  Goto-fallback and switch recovery are 0% for
+// these deliberately-simple fixtures, so they are tracked by the informational
+// report rather than asserted here; extending the witness to cover them needs a
+// jump-table / irreducible-CFG fixture (follow-up).
+
+/// Witness: across a modest deterministic swarm sample, the decompiler recovers
+/// both structured loops and conditionals from the fixtures, so the never-crash
+/// / determinism / balanced-brace properties above are exercised against real
+/// recovered control flow rather than trivial output.
+#[test]
+fn swarm_witnesses_reach_interesting_control_flow() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::deterministic();
+    let strat = arb_swarm_bits();
+
+    let (mut saw_loop, mut saw_conditional) = (false, false);
+
+    'outer: for _ in 0..500 {
+        let bits = strat.new_tree(&mut runner).unwrap().current();
+        let config = DecompilerConfig::from_swarm_bits(bits);
+        for (name, bytes, start) in test_programs() {
+            let code = decompile_with_config(bytes, start, name, config.clone());
+            saw_loop |= code.contains("while") || code.contains("for (") || code.contains("for(");
+            saw_conditional |= code.contains("if (") || code.contains("if(");
+            if saw_loop && saw_conditional {
+                break 'outer;
+            }
+        }
+    }
+
+    assert!(
+        saw_loop,
+        "swarm never recovered a structured loop (while/for) across 500 configs — \
+         loop structuring is no longer exercised, so the swarm invariants are vacuous"
+    );
+    assert!(
+        saw_conditional,
+        "swarm never recovered a conditional (if) across 500 configs — \
+         conditional structuring is no longer exercised, so the swarm invariants are vacuous"
+    );
+}
+
+// =============================================================================
+// Bounded-resource invariant — no output blowup, no hang
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Bug Bash 2026 playbook §7: a correct decompiler can still fall over by
+    /// exploding memory or hanging on pathological input.  This codifies the
+    /// quadratic/OOM regression class (e.g. the historical `substitute_vars`
+    /// expression blowup) as an automatic check: no swarm config may make the
+    /// output grow unboundedly relative to the unoptimized baseline, exceed a
+    /// generous absolute cap, or take anywhere near a hang threshold.
+    #[test]
+    fn swarm_output_and_time_are_bounded(bits in arb_swarm_bits()) {
+        // These fixtures render to well under 2 KiB; a 64 KiB cap is enormous
+        // slack yet still catches an OOM-class blowup (megabytes).
+        const ABSOLUTE_CAP: usize = 64 * 1024;
+        // Optimization should never 32x the unoptimized output; a real blowup
+        // dwarfs this.
+        const RELATIVE_FACTOR: usize = 32;
+        const RELATIVE_SLACK: usize = 8 * 1024;
+        // A single small function decompiles in well under a millisecond here; a
+        // 10 s ceiling only fires on a genuine hang / superlinear blowup.
+        let hang_threshold = std::time::Duration::from_secs(10);
+
+        let config = DecompilerConfig::from_swarm_bits(bits);
+        let baseline_config = DecompilerConfig::from_swarm_bits(0);
+
+        for (name, bytes, start) in test_programs() {
+            let baseline = decompile_with_config(bytes, start, name, baseline_config.clone());
+
+            let t0 = std::time::Instant::now();
+            let code = decompile_with_config(bytes, start, name, config.clone());
+            let elapsed = t0.elapsed();
+
+            prop_assert!(
+                code.len() <= ABSOLUTE_CAP,
+                "swarm config 0x{:08x} produced {} bytes for '{}' (cap {}) — output blowup\nconfig: {}",
+                bits, code.len(), name, ABSOLUTE_CAP, config.describe()
+            );
+
+            let relative_cap = baseline
+                .len()
+                .saturating_mul(RELATIVE_FACTOR)
+                .saturating_add(RELATIVE_SLACK);
+            prop_assert!(
+                code.len() <= relative_cap,
+                "swarm config 0x{:08x} produced {} bytes for '{}' vs baseline {} \
+                 (relative cap {}) — output blowup\nconfig: {}",
+                bits, code.len(), name, baseline.len(), relative_cap, config.describe()
+            );
+
+            prop_assert!(
+                elapsed < hang_threshold,
+                "swarm config 0x{:08x} took {:?} for '{}' (threshold {:?}) — \
+                 possible hang / superlinear blowup\nconfig: {}",
+                bits, elapsed, name, hang_threshold, config.describe()
+            );
+        }
+    }
 }
 
 // =============================================================================
