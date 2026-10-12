@@ -82,6 +82,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dwarf_structured"
+path = "fuzz_targets/dwarf_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fatbin_structured"
+path = "fuzz_targets/fatbin_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cfg_builder"
 path = "fuzz_targets/cfg_builder.rs"
 test = false
