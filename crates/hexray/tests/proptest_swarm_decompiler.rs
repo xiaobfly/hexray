@@ -686,24 +686,42 @@ fn swarm_witnesses_reach_interesting_control_flow() {
 // Bounded-resource invariant — no output blowup, no hang
 // =============================================================================
 
-/// Decompile on a worker thread, returning `None` if it does not finish within
-/// `timeout`.  A plain `Instant::now()` after the call can only *measure* a hang
-/// that already returned — if a pass loops forever the call never returns and no
-/// later assertion runs.  This watchdog makes the no-hang invariant actually
-/// enforceable: on timeout the caller fails the test (the stuck worker thread is
-/// abandoned, which is fine — the process exits on the test failure).
-fn decompile_within(
+/// Decompile under an enforced wall-clock deadline.  A plain `Instant::now()`
+/// after the call can only *measure* a hang that already returned — if a pass
+/// loops forever the call never returns and no later assertion runs.  This
+/// watchdog makes the no-hang invariant enforceable.
+///
+/// Rust cannot force-kill the worker thread, so on timeout we don't just abandon
+/// it (that would leak a spinning thread that proptest shrinking could multiply
+/// into a runaway / OOM).  Instead a timeout fails **hard and immediately**: it
+/// prints a diagnostic naming the fixture and swarm config, then aborts the
+/// process — turning a genuine hang into a loud, contained CI failure.  The
+/// fixtures decompile in well under a millisecond, so a multi-second overrun is
+/// a real infinite loop, never machine load.
+fn decompile_guarded(
     timeout: std::time::Duration,
     bytes: &'static [u8],
     start: u64,
     name: &'static str,
+    label: &str,
     config: DecompilerConfig,
-) -> Option<String> {
+) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
+    let cfg = config.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(decompile_with_config(bytes, start, name, config));
+        let _ = tx.send(decompile_with_config(bytes, start, name, cfg));
     });
-    rx.recv_timeout(timeout).ok()
+    match rx.recv_timeout(timeout) {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!(
+                "BOUNDED-RESOURCE HANG: fixture '{name}' ({label}) did not finish within \
+                 {timeout:?} — possible infinite loop / superlinear blowup\nconfig: {}",
+                config.describe()
+            );
+            std::process::abort();
+        }
+    }
 }
 
 proptest! {
@@ -733,16 +751,13 @@ proptest! {
         let baseline_config = DecompilerConfig::from_swarm_bits(0);
 
         for (name, bytes, start) in test_programs() {
-            let baseline = decompile_with_config(bytes, start, name, baseline_config.clone());
-
-            let result = decompile_within(hang_threshold, bytes, start, name, config.clone());
-            prop_assert!(
-                result.is_some(),
-                "swarm config 0x{:08x} did not finish for '{}' within {:?} — \
-                 possible hang / superlinear blowup\nconfig: {}",
-                bits, name, hang_threshold, config.describe()
-            );
-            let code = result.unwrap();
+            // Both the baseline (config 0 is itself a supported swarm config) and
+            // the sampled config run under the watchdog, so a hang in either one
+            // is contained rather than blocking the suite forever.
+            let baseline = decompile_guarded(
+                hang_threshold, bytes, start, name, "baseline", baseline_config.clone());
+            let code = decompile_guarded(
+                hang_threshold, bytes, start, name, "config", config.clone());
 
             prop_assert!(
                 code.len() <= ABSOLUTE_CAP,
