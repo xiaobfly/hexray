@@ -135,8 +135,54 @@ fn test_programs() -> Vec<(&'static str, &'static [u8], u64)> {
             ],
             0x1000,
         ),
+        // Equality compare-chain on a register argument — recovers a `switch`
+        // (switch detection keys on the register's var; a stack-spilled var does
+        // NOT, so this deliberately compares edi directly).  Exercises the
+        // SwitchDetection/SwitchRecovery passes and the emitter's switch path.
+        ("reg_dispatch", DISPATCH_BYTES, 0x1000),
+        // Three-entry irreducible loop: entry can land in the cycle at three
+        // points (fall-through + two `je`s), so it cannot be reduced to a
+        // natural loop.  With the IrreducibleHandling pass enabled the structurer
+        // duplicates it into a DAG; with that pass OMITTED (as many swarm configs
+        // do) it falls back to `goto`, exercising the unstructured-goto emitter
+        // path.  Reachability of both outcomes is asserted by the witness test.
+        ("tri_entry_cycle", IRREDUCIBLE_BYTES, 0x1000),
     ]
 }
+
+/// Register-argument equality compare-chain (`cmp edi,K; je …` for K∈{1,2,3}),
+/// each case assigning a distinct result and converging on a common return.
+/// Recovers `switch (arg0) { case 1/2/3: …; default: … }`.
+#[rustfmt::skip]
+const DISPATCH_BYTES: &[u8] = &[
+    0x83, 0xff, 0x01, 0x74, 0x11, // cmp edi,1; je caseA
+    0x83, 0xff, 0x02, 0x74, 0x13, // cmp edi,2; je caseB
+    0x83, 0xff, 0x03, 0x74, 0x15, // cmp edi,3; je caseC
+    0xb8, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x15, // default: eax=0; jmp end
+    0xb8, 0x0a, 0x00, 0x00, 0x00, 0xeb, 0x0e, // caseA:   eax=10; jmp end
+    0xb8, 0x14, 0x00, 0x00, 0x00, 0xeb, 0x07, // caseB:   eax=20; jmp end
+    0xb8, 0x1e, 0x00, 0x00, 0x00, 0xeb, 0x00, // caseC:   eax=30; jmp end
+    0xc3,                                     // end: ret
+];
+
+/// Three-entry irreducible loop.  `entry` reaches the {L1,L2,L3} cycle at three
+/// distinct points, so no single block dominates the cycle (irreducible).
+#[rustfmt::skip]
+const IRREDUCIBLE_BYTES: &[u8] = &[
+    0x55,                   // push rbp
+    0x48, 0x89, 0xe5,       // mov rbp, rsp
+    0x89, 0x7d, 0xfc,       // mov [rbp-4], edi
+    0x83, 0xff, 0x02, 0x74, 0x0d, // cmp edi,2; je L3
+    0x83, 0xff, 0x01, 0x74, 0x04, // cmp edi,1; je L2
+    0x83, 0x45, 0xfc, 0x01, // L1: add [rbp-4], 1
+    0x83, 0x45, 0xfc, 0x02, // L2: add [rbp-4], 2
+    0x83, 0x45, 0xfc, 0x04, // L3: add [rbp-4], 4
+    0x83, 0x7d, 0xfc, 0x64, // cmp [rbp-4], 100
+    0x7c, 0xee,             // jl L1  (back edge)
+    0x8b, 0x45, 0xfc,       // mov eax, [rbp-4]
+    0x5d,                   // pop rbp
+    0xc3,                   // ret
+];
 
 // =============================================================================
 // Helpers
@@ -565,17 +611,19 @@ fn weighted_swarm_reaches_distribution_tails() {
 // fixtures (or neutered structuring) would leave every property green while
 // testing nothing.
 //
-// We assert only on states these fixtures *guarantee* are reachable — structured
-// loops and conditionals (see `swarm_coverage_report`, which measures 100% loop
-// recovery for the loop fixture).  Goto-fallback and switch recovery are 0% for
-// these deliberately-simple fixtures, so they are tracked by the informational
-// report rather than asserted here; extending the witness to cover them needs a
-// jump-table / irreducible-CFG fixture (follow-up).
+// We assert on four interesting states, each guaranteed reachable by a dedicated
+// fixture: structured loops and conditionals (the loop/branch fixtures), a
+// `switch` (the `reg_dispatch` register compare-chain, under SwitchDetection),
+// and an unstructured `goto` (the `tri_entry_cycle` irreducible loop, reached by
+// the swarm configs that omit IrreducibleHandling — goto never appears with all
+// passes on, which is exactly why a *swarm* witness is the right place to prove
+// the fallback path still fires).
 
-/// Witness: across a modest deterministic swarm sample, the decompiler recovers
-/// both structured loops and conditionals from the fixtures, so the never-crash
-/// / determinism / balanced-brace properties above are exercised against real
-/// recovered control flow rather than trivial output.
+/// Witness: across a deterministic swarm sample, the decompiler recovers
+/// structured loops, conditionals, a `switch`, and an unstructured `goto` from
+/// the fixtures, so the never-crash / determinism / balanced-brace / bounded
+/// properties above are exercised against real recovered control flow (including
+/// the switch and irreducible-fallback emitter paths) rather than trivial output.
 #[test]
 fn swarm_witnesses_reach_interesting_control_flow() {
     use proptest::strategy::{Strategy, ValueTree};
@@ -584,16 +632,28 @@ fn swarm_witnesses_reach_interesting_control_flow() {
     let mut runner = TestRunner::deterministic();
     let strat = arb_swarm_bits();
 
-    let (mut saw_loop, mut saw_conditional) = (false, false);
+    // The four interesting control-flow states, with precise keyword checks
+    // (function names in the fixtures deliberately avoid these substrings):
+    //  - structured loop (while/for)    — the loop fixtures
+    //  - conditional (if)               — the branch fixtures
+    //  - switch                         — `reg_dispatch` under SwitchDetection
+    //  - goto (unstructured fallback)   — `tri_entry_cycle` when a config omits
+    //                                     IrreducibleHandling (so goto is reached
+    //                                     *across the swarm*, not with all passes on)
+    let (mut saw_loop, mut saw_conditional, mut saw_switch, mut saw_goto) =
+        (false, false, false, false);
 
-    'outer: for _ in 0..500 {
+    const ITERS: usize = 1500;
+    'outer: for _ in 0..ITERS {
         let bits = strat.new_tree(&mut runner).unwrap().current();
         let config = DecompilerConfig::from_swarm_bits(bits);
         for (name, bytes, start) in test_programs() {
             let code = decompile_with_config(bytes, start, name, config.clone());
             saw_loop |= code.contains("while") || code.contains("for (") || code.contains("for(");
             saw_conditional |= code.contains("if (") || code.contains("if(");
-            if saw_loop && saw_conditional {
+            saw_switch |= code.contains("switch (") || code.contains("switch(");
+            saw_goto |= code.contains("goto ");
+            if saw_loop && saw_conditional && saw_switch && saw_goto {
                 break 'outer;
             }
         }
@@ -601,19 +661,50 @@ fn swarm_witnesses_reach_interesting_control_flow() {
 
     assert!(
         saw_loop,
-        "swarm never recovered a structured loop (while/for) across 500 configs — \
+        "swarm never recovered a structured loop (while/for) across {ITERS} configs — \
          loop structuring is no longer exercised, so the swarm invariants are vacuous"
     );
     assert!(
         saw_conditional,
-        "swarm never recovered a conditional (if) across 500 configs — \
+        "swarm never recovered a conditional (if) across {ITERS} configs — \
          conditional structuring is no longer exercised, so the swarm invariants are vacuous"
+    );
+    assert!(
+        saw_switch,
+        "swarm never recovered a `switch` (reg_dispatch fixture) across {ITERS} configs — \
+         switch detection is no longer exercised, so the swarm invariants are vacuous"
+    );
+    assert!(
+        saw_goto,
+        "swarm never emitted an unstructured `goto` (tri_entry_cycle fixture) across {ITERS} \
+         configs — irreducible-CFG fallback is no longer exercised, so the swarm invariants \
+         are vacuous"
     );
 }
 
 // =============================================================================
 // Bounded-resource invariant — no output blowup, no hang
 // =============================================================================
+
+/// Decompile on a worker thread, returning `None` if it does not finish within
+/// `timeout`.  A plain `Instant::now()` after the call can only *measure* a hang
+/// that already returned — if a pass loops forever the call never returns and no
+/// later assertion runs.  This watchdog makes the no-hang invariant actually
+/// enforceable: on timeout the caller fails the test (the stuck worker thread is
+/// abandoned, which is fine — the process exits on the test failure).
+fn decompile_within(
+    timeout: std::time::Duration,
+    bytes: &'static [u8],
+    start: u64,
+    name: &'static str,
+    config: DecompilerConfig,
+) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(decompile_with_config(bytes, start, name, config));
+    });
+    rx.recv_timeout(timeout).ok()
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
@@ -623,7 +714,7 @@ proptest! {
     /// quadratic/OOM regression class (e.g. the historical `substitute_vars`
     /// expression blowup) as an automatic check: no swarm config may make the
     /// output grow unboundedly relative to the unoptimized baseline, exceed a
-    /// generous absolute cap, or take anywhere near a hang threshold.
+    /// generous absolute cap, or fail to finish within a hang threshold.
     #[test]
     fn swarm_output_and_time_are_bounded(bits in arb_swarm_bits()) {
         // These fixtures render to well under 2 KiB; a 64 KiB cap is enormous
@@ -634,7 +725,8 @@ proptest! {
         const RELATIVE_FACTOR: usize = 32;
         const RELATIVE_SLACK: usize = 8 * 1024;
         // A single small function decompiles in well under a millisecond here; a
-        // 10 s ceiling only fires on a genuine hang / superlinear blowup.
+        // 10 s ceiling only fires on a genuine hang / superlinear blowup. The
+        // watchdog ENFORCES it (a hang fails the case instead of stalling).
         let hang_threshold = std::time::Duration::from_secs(10);
 
         let config = DecompilerConfig::from_swarm_bits(bits);
@@ -643,9 +735,14 @@ proptest! {
         for (name, bytes, start) in test_programs() {
             let baseline = decompile_with_config(bytes, start, name, baseline_config.clone());
 
-            let t0 = std::time::Instant::now();
-            let code = decompile_with_config(bytes, start, name, config.clone());
-            let elapsed = t0.elapsed();
+            let result = decompile_within(hang_threshold, bytes, start, name, config.clone());
+            prop_assert!(
+                result.is_some(),
+                "swarm config 0x{:08x} did not finish for '{}' within {:?} — \
+                 possible hang / superlinear blowup\nconfig: {}",
+                bits, name, hang_threshold, config.describe()
+            );
+            let code = result.unwrap();
 
             prop_assert!(
                 code.len() <= ABSOLUTE_CAP,
@@ -662,13 +759,6 @@ proptest! {
                 "swarm config 0x{:08x} produced {} bytes for '{}' vs baseline {} \
                  (relative cap {}) — output blowup\nconfig: {}",
                 bits, code.len(), name, baseline.len(), relative_cap, config.describe()
-            );
-
-            prop_assert!(
-                elapsed < hang_threshold,
-                "swarm config 0x{:08x} took {:?} for '{}' (threshold {:?}) — \
-                 possible hang / superlinear blowup\nconfig: {}",
-                bits, elapsed, name, hang_threshold, config.describe()
             );
         }
     }
