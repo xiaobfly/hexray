@@ -262,27 +262,42 @@ impl FuzzedDwarf {
     }
 }
 
-fn exercise(debug_info: &[u8], debug_abbrev: &[u8], debug_str: &[u8]) {
+/// `require_parse`: when true (the structured path), `parse_all` MUST succeed.
+/// The builder emits exactly one well-framed CU — a valid abbrev table, a
+/// version-correct header, a computed `unit_length` with no trailer, and DIE
+/// attribute values whose byte lengths match each form — so a parse failure
+/// means the builder drifted or the parser regressed to rejecting valid CUs.
+/// Panicking (rather than silently returning) stops the structured path from
+/// degrading to the raw reject path, where the attribute/form decoders and deep
+/// accessors below would never run.  The raw path passes false.
+fn exercise(debug_info: &[u8], debug_abbrev: &[u8], debug_str: &[u8], require_parse: bool) {
     let parser = DebugInfoParser::new(debug_info, debug_abbrev, Some(debug_str));
-    if let Ok(units) = parser.parse_all() {
-        let debug = DebugInfo::new(units, Vec::new());
-        let _ = debug.find_location(0);
-        let _ = debug.find_function(0);
-        let _ = debug.functions().count();
+    match parser.parse_all() {
+        Ok(units) => {
+            let debug = DebugInfo::new(units, Vec::new());
+            let _ = debug.find_location(0);
+            let _ = debug.find_function(0);
+            let _ = debug.functions().count();
+        }
+        Err(e) => assert!(
+            !require_parse,
+            "builder-produced DWARF CU failed to parse: {e:?}"
+        ),
     }
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Structured path: a well-framed CU the raw splitter could never produce.
+    // Structured path: a well-framed CU the raw splitter could never produce,
+    // which MUST parse.
     if let Ok(fuzzed) = FuzzedDwarf::arbitrary(&mut Unstructured::new(data)) {
         let (info, abbrev, strs) = fuzzed.build();
-        exercise(&info, &abbrev, &strs);
+        exercise(&info, &abbrev, &strs, true);
     }
 
-    // Raw path: preserve the original byte-flipper coverage.
+    // Raw path: preserve the original byte-flipper coverage (parse may fail).
     let first = data.len() / 3;
     let second = first + (data.len() - first) / 2;
-    exercise(&data[..first], &data[first..second], &data[second..]);
+    exercise(&data[..first], &data[first..second], &data[second..], false);
     let big_endian = data.get(1).map(|b| b & 1 == 1).unwrap_or(false);
     let address_size = if data.first().map(|b| b & 1 == 1).unwrap_or(false) {
         8

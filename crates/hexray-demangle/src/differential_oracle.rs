@@ -243,6 +243,7 @@ fn corpus() -> Vec<&'static str> {
 #[cfg_attr(miri, ignore)] // cpp_demangle is skipped under miri elsewhere in this crate; match that.
 fn public_demangle_name_path_agrees_with_oracle() {
     let mut mismatches = Vec::new();
+    let mut compared = 0usize;
     for sym in corpus() {
         let (Some(ours), Some(theirs)) = (demangle(sym), cpp_oracle(sym)) else {
             continue;
@@ -250,6 +251,7 @@ fn public_demangle_name_path_agrees_with_oracle() {
         let (Some(our_path), Some(their_path)) = (name_path(&ours), name_path(&theirs)) else {
             continue;
         };
+        compared += 1;
         if our_path != their_path {
             mismatches.push(format!(
                 "{sym}: hexray={ours:?} path={our_path:?} vs oracle={theirs:?} path={their_path:?}"
@@ -261,6 +263,16 @@ fn public_demangle_name_path_agrees_with_oracle() {
         "public demangle() name-path diverged from cpp_demangle oracle:\n{}",
         mismatches.join("\n")
     );
+    // Non-vacuity witness: if `demangle`/`cpp_demangle` regressed to returning
+    // `None` for everything, every comparison above is skipped and the test
+    // passes without auditing anything.  Require that a healthy fraction of the
+    // curated corpus was actually compared.
+    assert!(
+        compared * 2 >= corpus().len() && compared > 0,
+        "differential audit was vacuous: only {compared}/{} corpus symbols were \
+         compared — the demanglers may have regressed to rejecting everything",
+        corpus().len()
+    );
 }
 
 #[test]
@@ -269,6 +281,7 @@ fn own_itanium_parser_name_path_agrees_with_oracle() {
     // Audit the *bespoke* Itanium parser directly (not the public path, which
     // prefers cpp_demangle), so divergences in our own code surface.
     let mut mismatches = Vec::new();
+    let mut compared = 0usize;
     for sym in corpus() {
         let Some(normalized) = normalize_itanium(sym) else {
             continue;
@@ -279,6 +292,7 @@ fn own_itanium_parser_name_path_agrees_with_oracle() {
         let (Some(our_path), Some(their_path)) = (name_path(&ours), name_path(&theirs)) else {
             continue;
         };
+        compared += 1;
         if our_path != their_path {
             mismatches.push(format!(
                 "{sym}: hexray-itanium={ours:?} path={our_path:?} \
@@ -290,6 +304,15 @@ fn own_itanium_parser_name_path_agrees_with_oracle() {
         mismatches.is_empty(),
         "bespoke Itanium parser name-path diverged from cpp_demangle oracle:\n{}",
         mismatches.join("\n")
+    );
+    // Non-vacuity witness (see `public_demangle_name_path_agrees_with_oracle`):
+    // if `demangle_itanium` regressed to returning `None` for every symbol, this
+    // whole audit would pass without comparing anything.
+    assert!(
+        compared * 2 >= corpus().len() && compared > 0,
+        "bespoke-parser audit was vacuous: only {compared}/{} corpus symbols were \
+         compared — demangle_itanium may have regressed to rejecting everything",
+        corpus().len()
     );
 }
 
@@ -339,7 +362,18 @@ proptest! {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn generated_nested_names_agree_on_name_path(sym in arb_mangled_nested_name()) {
-        if let (Some(ours), Some(theirs)) = (demangle_itanium(&sym), cpp_oracle(&sym)) {
+        // `arb_mangled_nested_name` only produces well-formed `_ZN..E<type>`
+        // manglings, so the bespoke parser MUST accept every one.  Requiring
+        // `Some` here (rather than silently skipping on `None`) keeps the
+        // property non-vacuous: a regression that made `demangle_itanium` reject
+        // valid input would fail loudly instead of making the test pass trivially.
+        let ours = demangle_itanium(&sym);
+        prop_assert!(
+            ours.is_some(),
+            "bespoke parser rejected a well-formed mangling {sym:?}"
+        );
+        let ours = ours.unwrap();
+        if let Some(theirs) = cpp_oracle(&sym) {
             if let (Some(our_path), Some(their_path)) = (name_path(&ours), name_path(&theirs)) {
                 prop_assert_eq!(
                     &our_path, &their_path,

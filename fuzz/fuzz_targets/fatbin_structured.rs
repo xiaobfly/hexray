@@ -67,9 +67,23 @@ impl FuzzedFatbin {
     }
 }
 
-fn exercise(bytes: &[u8]) {
-    let Ok(w) = FatbinWrapper::parse(bytes) else {
-        return;
+/// `require_parse`: when true (the structured path), the wrapper MUST parse —
+/// the builder always emits valid magic, a correct `header_size`, and in-bounds
+/// contiguous entries, so a parse failure means the builder drifted out of shape
+/// or the parser regressed to rejecting valid wrappers.  Making that a loud
+/// panic (rather than a silent `return`) keeps the structured path from quietly
+/// degrading to the raw reject path, where the entry-chain / classification /
+/// bounds assertions below would never run.  The raw path passes false.
+fn exercise(bytes: &[u8], require_parse: bool) {
+    let w = match FatbinWrapper::parse(bytes) {
+        Ok(w) => w,
+        Err(e) => {
+            assert!(
+                !require_parse,
+                "builder-produced fatbin wrapper failed to parse: {e:?}"
+            );
+            return;
+        }
     };
     let buffer_start = bytes.as_ptr() as usize;
     let buffer_end = buffer_start + bytes.len();
@@ -90,10 +104,10 @@ fn exercise(bytes: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Structured path: a valid multi-entry wrapper.
+    // Structured path: a valid multi-entry wrapper that MUST parse.
     if let Ok(fuzzed) = FuzzedFatbin::arbitrary(&mut Unstructured::new(data)) {
-        exercise(&fuzzed.build());
+        exercise(&fuzzed.build(), true);
     }
-    // Raw path: preserve the original byte-level coverage.
-    exercise(data);
+    // Raw path: preserve the original byte-level coverage (parse may fail).
+    exercise(data, false);
 });
