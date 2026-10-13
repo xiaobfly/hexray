@@ -369,6 +369,8 @@ fuzz/fuzz_targets/
 | `macho_parser` | Malformed Mach-O files |
 | `elf_structured` | Structure-aware ELF fuzzing |
 | `macho_structured` | Structure-aware Mach-O fuzzing |
+| `dwarf_structured` | Structure-aware DWARF fuzzing (well-framed CU: abbrev table + DIEs) |
+| `fatbin_structured` | Structure-aware CUDA fatbin fuzzing (valid wrapper + entry chain) |
 
 ### Analysis Fuzz Targets
 

@@ -68,6 +68,8 @@ cargo install cargo-fuzz
 |--------|-------------|
 | `elf_structured` | Uses the `arbitrary` crate to generate valid-ish ELF headers with fuzzed field values |
 | `macho_structured` | Uses the `arbitrary` crate to generate valid-ish Mach-O headers with fuzzed field values |
+| `dwarf_structured` | Builds a well-framed DWARF CU (valid abbrev table + computed `unit_length` + form-correct DIE values) so coverage reaches the attribute/form decoders |
+| `fatbin_structured` | Builds a valid CUDA fatbin wrapper (correct magic, computed `header_size`, per-entry `header_len`/`payload_size`) so the multi-entry chain and kind/SM classification are exercised |
 
 Structure-aware targets generate inputs that follow the expected format structure (magic bytes, headers, sections) while fuzzing individual field values. This achieves higher code coverage than pure random mutation.
 

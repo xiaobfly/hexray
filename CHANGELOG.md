@@ -5,6 +5,38 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.20] - 2026-10-13
+
+Correctness-infrastructure release (Bug Bash 2026 playbook adoption). No
+user-facing decompiler behavior changes — this hardens the test, fuzz, and
+documentation posture.
+
+### Testing & fuzzing
+
+- **Demangler differential oracle.** Audit the bespoke Itanium parser against the
+  `cpp_demangle` reference via a formatting-robust name-path projection
+  (normalizing GNU ABI tags, declining symbolic operators), over a curated corpus
+  plus property tests. Non-vacuity guarded: the audit asserts a healthy fraction
+  of the corpus is actually compared.
+- **Swarm reachability witness.** Assert the feature-omission swarm actually drives
+  the decompiler through structured loops, conditionals, `switch` recovery, and the
+  unstructured `goto` fallback (two new raw-x86-64 fixtures), so the never-crash /
+  determinism / balanced-brace properties are not vacuous.
+- **Bounded-resource invariant.** Cap decompiler output size (absolute and relative
+  to the unoptimized baseline) and enforce a wall-clock hang watchdog across swarm
+  configurations, codifying the quadratic/OOM blow-up regression class.
+- **Structure-aware fuzz targets.** Add `dwarf_structured` and `fatbin_structured`
+  (`arbitrary`-driven) that build well-framed DWARF compilation units and CUDA
+  fatbin wrappers, so coverage reaches the attribute/form decoders and entry-chain
+  classification a raw byte-flipper never gets past. Builder output is required to
+  parse, keeping the structured path non-vacuous.
+
+### Documentation
+
+- **`CLAUDE.md`.** Add a working-agreement file: the correctness-playbook digest,
+  hexray's named invariants, the local tiered CI workflow, the release gate, and
+  file-scope guardrails.
+
 ## [1.3.19] - 2026-10-11
 
 ### Decompiler — C++ exception-handling catch-body recovery

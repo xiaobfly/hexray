@@ -1261,6 +1261,11 @@ fn demangle_rust_v0(name: &str) -> Option<String> {
     }
 }
 
+/// Differential tests of the bespoke Itanium parser against the `cpp_demangle`
+/// reference oracle (Bug Bash 2026 playbook §5).
+#[cfg(test)]
+mod differential_oracle;
+
 #[cfg(test)]
 mod tests {
     use super::*;
