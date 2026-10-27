@@ -963,6 +963,118 @@ impl RelocationTable {
     }
 }
 
+/// Locator that identifies a variable inside a decompiled function.
+///
+/// Locators are resolved against the variable's [`Variable`] kind at emission
+/// time, never by matching rendered text, so a rename cannot silently retarget
+/// a different variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VariableOverrideLocator {
+    /// Formal parameter by declaration index (`VarKind::Arg`).
+    Parameter(u8),
+    /// Frame-relative stack slot at the given offset (`VarKind::Stack`).
+    Stack(i64),
+    /// Register variable: `VarKind::Register(index)` with the given byte size.
+    Register {
+        /// `VarKind::Register` id to match.
+        index: u16,
+        /// Byte size the variable must have.
+        size: u8,
+    },
+    /// Temporary variable: `VarKind::Temp(index)` with the given byte size.
+    Temp {
+        /// `VarKind::Temp` id to match.
+        index: u32,
+        /// Byte size the variable must have.
+        size: u8,
+    },
+}
+
+impl VariableOverrideLocator {
+    /// Whether this locator addresses `var`.
+    ///
+    /// `Parameter` matches formal-argument variables (`VarKind::Arg`).
+    /// Register- and stack-passed parameters are covered through the
+    /// parameter-name aliases installed from the recovered or overridden
+    /// signature (`argN`, lifted stack slots).
+    pub(crate) fn matches_variable(&self, var: &Variable) -> bool {
+        use expression::VarKind;
+        match (self, &var.kind) {
+            (Self::Parameter(index), VarKind::Arg(arg)) => *arg == *index,
+            (Self::Stack(offset), VarKind::Stack(var_offset)) => var_offset == offset,
+            (Self::Register { index, size }, VarKind::Register(var_index)) => {
+                var_index == index && var.size == *size
+            }
+            (Self::Temp { index, size }, VarKind::Temp(var_index)) => {
+                var_index == index && var.size == *size
+            }
+            _ => false,
+        }
+    }
+}
+
+/// User-supplied name and/or type override for a single variable.
+///
+/// Overrides are consumed where a [`Variable`]'s kind binds to a display name
+/// or type, so they survive re-analysis and are never applied by rewriting
+/// emitted text. When both fields are `None` the override is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableOverride {
+    /// Which variable the override addresses.
+    pub locator: VariableOverrideLocator,
+    /// Replacement display name.
+    pub name: Option<String>,
+    /// Replacement C type string (e.g. `"size_t"`, `"char*"`).
+    pub type_name: Option<String>,
+}
+
+impl VariableOverride {
+    /// Creates an override for `locator` with neither name nor type set.
+    pub fn new(locator: VariableOverrideLocator) -> Self {
+        Self {
+            locator,
+            name: None,
+            type_name: None,
+        }
+    }
+
+    /// Sets the replacement display name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the replacement C type string.
+    pub fn with_type_name(mut self, type_name: impl Into<String>) -> Self {
+        self.type_name = Some(type_name.into());
+        self
+    }
+}
+
+/// Applies `Parameter`-locator names from user variable overrides to a
+/// signature's parameter list.
+///
+/// The locator is more specific than the signature's own parameter names, so it
+/// wins for the parameter it addresses. Types are carried through the emitter's
+/// type map (see `Decompiler::seed_override_parameter_types`); `ParamType` has
+/// no C-string parser and is not mutated here.
+pub(crate) fn apply_parameter_name_overrides(
+    overrides: &[VariableOverride],
+    signature: &mut FunctionSignature,
+) {
+    for over in overrides {
+        let VariableOverrideLocator::Parameter(index) = over.locator else {
+            continue;
+        };
+        let Some(name) = &over.name else {
+            continue;
+        };
+        if let Some(param) = signature.parameters.get_mut(usize::from(index)) {
+            param.name = name.clone();
+        }
+    }
+}
+
 /// Main entry point for decompilation.
 ///
 /// Takes a CFG and produces pseudo-code output.
@@ -1032,6 +1144,15 @@ pub struct Decompiler {
     pub current_function_kind: Option<SymbolKind>,
     /// Thread-pointer-relative TLS symbol names keyed by byte offset.
     pub tls_symbol_offsets: HashMap<i64, String>,
+    /// Explicit function signature override.
+    ///
+    /// When set it outranks C++-adjusted and automatically recovered
+    /// signatures for both the emitted header and parameter binding. The
+    /// structuring/emission pipeline still runs unchanged.
+    pub signature_override: Option<FunctionSignature>,
+    /// User variable name/type overrides, applied where a [`Variable`] kind
+    /// binds to a display name or type.
+    pub variable_overrides: Vec<VariableOverride>,
 }
 
 impl Default for Decompiler {
@@ -1062,6 +1183,8 @@ impl Default for Decompiler {
             throw_thunks: HashMap::new(),
             current_function_kind: None,
             tls_symbol_offsets: HashMap::new(),
+            signature_override: None,
+            variable_overrides: Vec::new(),
         }
     }
 }
@@ -1306,6 +1429,31 @@ impl Decompiler {
         self
     }
 
+    /// Sets an explicit function signature that outranks automatic recovery.
+    ///
+    /// The override is injected before type inference and expression binding:
+    /// its parameter names and types seed the emitter's type map, its
+    /// parameter list becomes the emitted header, and its return type drives
+    /// the header and return fallbacks. C++ special-member adjustments,
+    /// exception handling and type-database lookups keep running; they simply
+    /// cannot replace the user's parameter names/types. Structuring and
+    /// emission still go through the normal pipeline.
+    pub fn with_signature_override(mut self, signature: FunctionSignature) -> Self {
+        self.signature_override = Some(signature);
+        self
+    }
+
+    /// Sets user variable name/type overrides.
+    ///
+    /// Overrides win over DWARF debug names and automatic inference and are
+    /// applied where a variable's kind is bound to a name/type — never by
+    /// rewriting emitted text. `Parameter` overrides on a formal argument also
+    /// update the emitted parameter list so header and body agree.
+    pub fn with_variable_overrides(mut self, overrides: Vec<VariableOverride>) -> Self {
+        self.variable_overrides = overrides;
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 0: Run type inference if enabled
@@ -1340,6 +1488,11 @@ impl Decompiler {
         for (k, v) in &self.type_info {
             merged_types.insert(k.clone(), v.clone());
         }
+        // User parameter types outrank every inference source. Seed them
+        // before expression-level type propagation so it observes the user's
+        // types, and again right before emission (below) so no later pass can
+        // demote them.
+        self.seed_override_parameter_types(&mut merged_types);
 
         // Step 1: Structure the control flow.
         // For clang C++20 coroutine `.resume` clones the resume-index dispatch is a
@@ -1542,6 +1695,9 @@ impl Decompiler {
         };
 
         // Step 6: Emit pseudo-code
+        // Re-assert user parameter types after every inference/seed pass so a
+        // conflicting hint can never demote an explicit override.
+        self.seed_override_parameter_types(&mut merged_types);
         let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
@@ -1553,6 +1709,9 @@ impl Decompiler {
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery)
+            // User variable overrides are bound at the VarKind → name/type
+            // points inside the emitter.
+            .with_variable_overrides(self.variable_overrides.clone())
             // Coroutine-keyword rendering (`co_return`) applies only to the
             // resume steppers (`.actor` / `.resume`), where the promise body is
             // inlined — not the `.destroy` / `.cleanup` teardown partitions.
@@ -1571,7 +1730,11 @@ impl Decompiler {
             emitter = emitter.with_constant_database(db.clone());
         }
 
-        let code = if let Some(signature) = self.adjusted_cpp_special_signature(cfg, func_name) {
+        let code = if let Some(signature_override) = self.signature_override.as_ref() {
+            // User override outranks C++-adjusted and recovered signatures.
+            // Structuring already ran above; only the signature source changes.
+            emitter.emit_with_signature(&structured, &display_name, signature_override)
+        } else if let Some(signature) = self.adjusted_cpp_special_signature(cfg, func_name) {
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else if self.enable_signature_recovery {
             let signature = SignatureRecovery::new(self.calling_convention)
@@ -2088,6 +2251,44 @@ impl Decompiler {
         None
     }
 
+    /// Seeds user-supplied parameter types into the emitter's type map.
+    ///
+    /// Two sources carry user intent: an explicit [`FunctionSignature`]
+    /// override and [`VariableOverride`]s with a [`VariableOverrideLocator::Parameter`]
+    /// locator. Both are seeded under the `argN` alias (the name the emitter
+    /// resolves register-passed parameters through), the declared parameter
+    /// name, and any override-provided name. Called before and after the
+    /// inference merges: inference should observe the user's types, and must
+    /// not demote them afterwards.
+    fn seed_override_parameter_types(&self, types: &mut HashMap<String, String>) {
+        if let Some(signature) = &self.signature_override {
+            for (index, param) in signature.parameters.iter().enumerate() {
+                let ty = param.param_type.to_c_string();
+                types.insert(format!("arg{index}"), ty.clone());
+                types.insert(param.name.clone(), ty);
+            }
+        }
+
+        for over in &self.variable_overrides {
+            let (VariableOverrideLocator::Parameter(index), Some(ty)) =
+                (over.locator, over.type_name.as_ref())
+            else {
+                continue;
+            };
+            types.insert(format!("arg{index}"), ty.clone());
+            if let Some(name) = &over.name {
+                types.insert(name.clone(), ty.clone());
+            }
+            if let Some(param) = self
+                .signature_override
+                .as_ref()
+                .and_then(|signature| signature.parameters.get(usize::from(index)))
+            {
+                types.insert(param.name.clone(), ty.clone());
+            }
+        }
+    }
+
     fn seed_cpp_special_type_info(
         &self,
         body: &[StructuredNode],
@@ -2601,8 +2802,17 @@ impl Decompiler {
     /// Recovers the function signature from a CFG.
     ///
     /// This performs signature recovery without generating decompiled code,
-    /// useful for building symbol tables or function prototypes.
+    /// useful for building symbol tables or function prototypes. When a
+    /// [`Self::signature_override`] is configured it is returned as the
+    /// effective signature, with `Parameter` variable-override names applied,
+    /// so callers observe exactly what [`Self::decompile`] will emit.
     pub fn recover_signature(&self, cfg: &ControlFlowGraph) -> FunctionSignature {
+        if let Some(signature) = &self.signature_override {
+            let mut signature = signature.clone();
+            apply_parameter_name_overrides(&self.variable_overrides, &mut signature);
+            return signature;
+        }
+
         let structured = self.structure(cfg);
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_binary_data(self.binary_data.as_deref())
@@ -2625,7 +2835,9 @@ impl Decompiler {
                 self.calling_convention,
             ))
             .with_aapcs_va_list_counts(self.scan_aapcs_va_list_if_aarch64(cfg));
-        recovery.analyze(&structured)
+        let mut signature = recovery.analyze(&structured);
+        apply_parameter_name_overrides(&self.variable_overrides, &mut signature);
+        signature
     }
 
     /// Decompiles a CFG and returns the structured representation.
@@ -2780,6 +2992,7 @@ impl Decompiler {
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery)
+            .with_variable_overrides(self.variable_overrides.clone())
             .with_binary_data(self.binary_data.clone());
         if let Some(ref db) = self.summary_database {
             emitter = emitter.with_summary_database(db.clone());
@@ -2790,7 +3003,10 @@ impl Decompiler {
         if let Some(ref db) = self.constant_database {
             emitter = emitter.with_constant_database(db.clone());
         }
-        let code = emitter.emit(&transformed, func_name);
+        let code = match self.signature_override.as_ref() {
+            Some(signature) => emitter.emit_with_signature(&transformed, func_name, signature),
+            None => emitter.emit(&transformed, func_name),
+        };
 
         (struct_defs, code)
     }
@@ -3573,7 +3789,7 @@ fn extract_catch_bodies_from_selector_dispatch(
                     h.catch_type.clone()
                 },
                 variable_name: Some("e".to_string()),
-                body: body,
+                body,
                 landing_pad: h.landing_pad,
             })
             .into_iter()
@@ -3606,7 +3822,7 @@ fn extract_catch_bodies_from_selector_dispatch(
                         h.catch_type.clone()
                     },
                     variable_name: Some("e".to_string()),
-                    body: body,
+                    body,
                     landing_pad: h.landing_pad,
                 })
                 .into_iter()
@@ -3623,7 +3839,7 @@ fn extract_catch_bodies_from_selector_dispatch(
                         h.catch_type.clone()
                     },
                     variable_name: Some("e".to_string()),
-                    body: body,
+                    body,
                     landing_pad: h.landing_pad,
                 })
                 .into_iter()
@@ -4098,7 +4314,7 @@ where
         else_body,
     }) = cleaned.last()
     {
-        let else_empty = else_body.as_ref().map_or(true, |e| e.is_empty());
+        let else_empty = else_body.as_ref().is_none_or(|e| e.is_empty());
         if else_empty && !then_body.is_empty() && is_selector_condition(condition) {
             let StructuredNode::If { then_body, .. } = cleaned.pop().expect("checked last") else {
                 unreachable!()
@@ -4173,7 +4389,7 @@ fn node_uses_var(node: &StructuredNode, var_name: &str) -> bool {
             then_body.iter().any(|n| node_uses_var(n, var_name))
                 || else_body
                     .as_ref()
-                    .map_or(false, |e| e.iter().any(|n| node_uses_var(n, var_name)))
+                    .is_some_and(|e| e.iter().any(|n| node_uses_var(n, var_name)))
         }
         StructuredNode::While { body, .. }
         | StructuredNode::DoWhile { body, .. }
@@ -4185,7 +4401,7 @@ fn node_uses_var(node: &StructuredNode, var_name: &str) -> bool {
                 .any(|(_, b)| b.iter().any(|n| node_uses_var(n, var_name)))
                 || default
                     .as_ref()
-                    .map_or(false, |d| d.iter().any(|n| node_uses_var(n, var_name)))
+                    .is_some_and(|d| d.iter().any(|n| node_uses_var(n, var_name)))
         }
         StructuredNode::Sequence(inner) => inner.iter().any(|n| node_uses_var(n, var_name)),
         StructuredNode::TryCatch { try_body, .. } => {
@@ -4193,7 +4409,7 @@ fn node_uses_var(node: &StructuredNode, var_name: &str) -> bool {
         }
         StructuredNode::Label(_) | StructuredNode::Goto(_) | StructuredNode::Break => false,
         StructuredNode::Continue => false,
-        StructuredNode::Return(r) => r.as_ref().map_or(false, |r| expr_uses_var(r, var_name)),
+        StructuredNode::Return(r) => r.as_ref().is_some_and(|r| expr_uses_var(r, var_name)),
     }
 }
 
@@ -4469,6 +4685,289 @@ mod tests {
         // Should contain if/else structure
         assert!(output.contains("if"));
         assert!(output.contains("else"));
+    }
+
+    /// Two-parameter x86-64 CFG: stores `rdi`/`rsi` to locals and adds them.
+    ///
+    /// ```text
+    ///   mov [rbp-0x8], rdi
+    ///   mov [rbp-0x10], rsi
+    ///   mov rax, [rbp-0x8]
+    ///   add rax, [rbp-0x10]
+    ///   ret
+    /// ```
+    fn make_two_param_cfg() -> ControlFlowGraph {
+        use hexray_core::{Architecture, MemoryRef, Operand, Register, RegisterClass};
+
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let rsi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 64);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(
+            Instruction::new(0x1000, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x8, 8)),
+                    Operand::Register(rdi),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x1004, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x10, 8)),
+                    Operand::Register(rsi),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x1008, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x8, 8)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x100c, 4, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x10, 8)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x1010, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+        cfg
+    }
+
+    fn two_param_signature_override() -> FunctionSignature {
+        let mut signature = FunctionSignature::new(CallingConvention::SystemV);
+        signature.has_return = true;
+        signature.return_type = ParamType::SignedInt(64);
+        signature.parameters.push(Parameter::new(
+            "argc",
+            ParamType::SignedInt(32),
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+        signature.parameters.push(Parameter::new(
+            "argv",
+            ParamType::Named("char**".to_string()),
+            ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
+        ));
+        signature
+    }
+
+    #[test]
+    fn test_signature_override_controls_header_and_parameter_names() {
+        let cfg = make_two_param_cfg();
+
+        // Baseline: recovery names the parameters arg0/arg1 and picks its own
+        // types. Documents that the no-override path is unchanged.
+        let baseline = Decompiler::new()
+            .with_addresses(false)
+            .decompile(&cfg, "sub_1000");
+        assert!(
+            baseline.lines().next().unwrap_or_default().contains("arg0"),
+            "baseline header should keep the recovered names:\n{baseline}"
+        );
+        assert!(
+            !baseline.contains("argc") && !baseline.contains("argv"),
+            "baseline must not use the override names:\n{baseline}"
+        );
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_signature_override(two_param_signature_override())
+            .decompile(&cfg, "sub_1000");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(
+            header.starts_with("int64_t sub_1000("),
+            "header must use the override return type:\n{output}"
+        );
+        assert!(
+            header.contains("int32_t argc"),
+            "header must use the override parameter type/name:\n{output}"
+        );
+        assert!(
+            header.contains("char** argv"),
+            "header must use the override parameter type/name:\n{output}"
+        );
+        assert!(
+            !output.contains("arg0") && !output.contains("arg1"),
+            "override parameter names must replace the recovered ones:\n{output}"
+        );
+        // Still a structured function body, not a short-circuited path.
+        assert!(output.contains('{') && output.contains('}'), "{output}");
+    }
+
+    #[test]
+    fn test_signature_override_beats_dwarf_and_type_info() {
+        let cfg = make_two_param_cfg();
+
+        let mut type_info = HashMap::new();
+        type_info.insert("arg0".to_string(), "int32_t*".to_string());
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_dwarf_param_names(vec!["dwarf_p0".to_string(), "dwarf_p1".to_string()])
+            .with_type_info(type_info)
+            .with_signature_override(two_param_signature_override())
+            .decompile(&cfg, "sub_1000");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(header.contains("argc"), "{output}");
+        assert!(header.contains("argv"), "{output}");
+        assert!(
+            !output.contains("dwarf_p0") && !output.contains("dwarf_p1"),
+            "DWARF parameter names must not leak through:\n{output}"
+        );
+        assert!(
+            header.contains("int32_t argc"),
+            "an explicit user type must not be demoted by the type map hint:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_recover_signature_returns_effective_override() {
+        let cfg = make_two_param_cfg();
+
+        let signature = Decompiler::new()
+            .with_signature_override(two_param_signature_override())
+            .with_variable_overrides(vec![
+                VariableOverride::new(VariableOverrideLocator::Parameter(0)).with_name("renamed"),
+            ])
+            .recover_signature(&cfg);
+
+        assert_eq!(signature.return_type, ParamType::SignedInt(64));
+        assert_eq!(signature.parameters.len(), 2);
+        assert_eq!(signature.parameters[0].name, "renamed");
+        assert_eq!(signature.parameters[1].name, "argv");
+        assert_eq!(signature.parameters[1].param_type, ParamType::Named("char**".into()));
+    }
+
+    #[test]
+    fn test_variable_override_beats_dwarf_parameter_names() {
+        let cfg = make_two_param_cfg();
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_dwarf_param_names(vec!["dwarf_p0".to_string(), "dwarf_p1".to_string()])
+            .with_variable_overrides(vec![
+                VariableOverride::new(VariableOverrideLocator::Parameter(0)).with_name("user_p0"),
+            ])
+            .decompile(&cfg, "sub_1000");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(header.contains("user_p0"), "{output}");
+        assert!(
+            !output.contains("dwarf_p0"),
+            "the user override must beat the DWARF parameter name:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_variable_override_parameter_zero_renames_parameter() {
+        let cfg = make_two_param_cfg();
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_variable_overrides(vec![
+                VariableOverride::new(VariableOverrideLocator::Parameter(0))
+                    .with_name("count")
+                    .with_type_name("uint32_t"),
+            ])
+            .decompile(&cfg, "sub_1000");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(
+            header.contains("count"),
+            "parameter 0 must carry the override name:\n{output}"
+        );
+        assert!(
+            !output.contains("arg0"),
+            "the automatic parameter name must be gone:\n{output}"
+        );
+        assert!(
+            header.contains("uint32_t count"),
+            "a user parameter type must be consumed in the header:\n{output}"
+        );
+        assert!(
+            output.contains("count =")
+                || output.contains("= count")
+                || output.contains("count;"),
+            "body references must use the override name:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_variable_override_matches_stack_slot_by_kind() {
+        let cfg = make_two_param_cfg();
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_dwarf_names(HashMap::from([(-8i128, "dwarf_local".to_string())]))
+            .with_variable_overrides(vec![
+                VariableOverride::new(VariableOverrideLocator::Stack(-0x8))
+                    .with_name("saved")
+                    .with_type_name("int64_t"),
+            ])
+            .decompile(&cfg, "sub_1000");
+
+        assert!(
+            output.contains("saved"),
+            "stack override must rename the frame slot:\n{output}"
+        );
+        assert!(
+            !output.contains("dwarf_local"),
+            "the user override must beat the DWARF local name:\n{output}"
+        );
+        assert!(
+            !output.contains("local_8") && !output.contains("var_8"),
+            "the automatic stack name must be gone:\n{output}"
+        );
+        assert!(
+            output.contains("int64_t saved;"),
+            "the override type must drive the declaration:\n{output}"
+        );
+        assert!(
+            output.contains("saved ="),
+            "body uses must be generated with the override name:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_signature_override_beats_variable_parameter_override() {
+        let cfg = make_two_param_cfg();
+
+        // The `VariableOverride` locator is more specific than the signature
+        // parameter list, so it wins for the parameter it addresses.
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_signature_override(two_param_signature_override())
+            .with_variable_overrides(vec![
+                VariableOverride::new(VariableOverrideLocator::Parameter(0)).with_name("renamed"),
+            ])
+            .decompile(&cfg, "sub_1000");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(header.contains("renamed"), "{output}");
+        assert!(!header.contains("argc"), "{output}");
+        assert!(header.contains("argv"), "other parameters keep the override signature:\n{output}");
     }
 
     #[test]

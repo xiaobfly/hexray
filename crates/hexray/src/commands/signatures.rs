@@ -13,7 +13,7 @@ use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
 use hexray_core::Symbol;
 
 /// Signature management actions.
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum SignaturesAction {
     /// Scan binary for known library functions
     Scan {
@@ -96,7 +96,7 @@ pub fn handle_signatures_command_no_binary(action: &SignaturesAction) -> Result<
                 println!(
                     "{:<24} {:<12} {:<8.2} {:>4} bytes",
                     sig.name,
-                    &sig.library,
+                    sig.library,
                     sig.confidence,
                     sig.pattern.len()
                 );
@@ -303,7 +303,7 @@ fn print_scan_result(arch_str: &str, confidence: f32, matches: &[hexray_signatur
                 "{:#016x} {:<24} {:<12} {:.2}",
                 m.offset,
                 m.signature.preferred_name(),
-                &m.signature.library,
+                m.signature.library,
                 m.confidence
             );
         }
@@ -398,6 +398,10 @@ mod tests {
 
         fn size(&self) -> u64 {
             self.data.len() as u64
+        }
+
+        fn file_offset(&self) -> u64 {
+            0
         }
 
         fn data(&self) -> &[u8] {

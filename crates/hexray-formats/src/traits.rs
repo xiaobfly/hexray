@@ -77,6 +77,13 @@ pub trait Section {
     /// Size in bytes.
     fn size(&self) -> u64;
 
+    /// File offset of the section payload inside the parsed container.
+    ///
+    /// Consumers that translate between virtual addresses and file bytes (byte
+    /// patching, export) need this; without it they would have to guess from
+    /// section names.
+    fn file_offset(&self) -> u64;
+
     /// Raw section data.
     fn data(&self) -> &[u8];
 
