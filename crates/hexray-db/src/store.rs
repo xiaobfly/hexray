@@ -1,5 +1,6 @@
 //! The `.hxdb` store: creation, opening, snapshots, and transactions.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use rusqlite::{
     Connection, DatabaseName, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 
-use crate::address::{Address, FileOffset};
+use crate::address::{Address, AddressRange, FileOffset};
 use crate::edit::{self, Edit, InverseOp};
 use crate::model::*;
 use crate::schema;
@@ -27,6 +28,10 @@ pub const MAX_PATCH_BYTES: usize = 1024 * 1024;
 pub const MAX_HISTORY_ENTRIES: u64 = 100_000;
 /// Lock wait before reporting `DbError::Busy`.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Maximum number of bound values in one batch-read `IN` query.
+const MAX_ADDRESS_CHUNK: usize = 128;
+/// Identity of one stored xref row, used to deduplicate chunked lookups.
+type XrefKey = ([u8; 8], [u8; 8], String, Option<[u8; 8]>, String);
 
 /// How the file is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,8 +268,19 @@ impl Database {
                 actual: current.0,
             });
         }
+        let mut replaced_cfg = false;
         for unit in &batch.units {
+            if matches!(&unit.payload, AnalysisPayload::FunctionCfg(_)) {
+                replaced_cfg = true;
+            }
             publish_unit(&tx, unit)?;
+        }
+        // Two owners may share a tail instruction. Sweep only once every CFG
+        // owner in this batch has been replaced, inside the same transaction,
+        // so the row is judged an orphan against the batch's final state.
+        // Index-only and render-only batches never touch instruction rows.
+        if replaced_cfg {
+            sweep_orphan_instructions(&tx)?;
         }
         tx.commit()?;
         Ok(())
@@ -738,14 +754,7 @@ impl<'a> ReadSnapshot<'a> {
         let mut rows = statement.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let origin: String = row.get(4)?;
-            out.push(SymbolInfo {
-                address: Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?,
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                size: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                origin: SymbolOrigin::parse(&origin).unwrap_or(SymbolOrigin::Loader),
-            });
+            out.push(read_symbol_row(row)?);
         }
         Ok(out)
     }
@@ -908,13 +917,7 @@ impl<'a> ReadSnapshot<'a> {
         let mut rows = statement.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(TypeRow {
-                name: row.get(0)?,
-                kind: TypeKind::parse(&row.get::<_, String>(1)?).unwrap_or(TypeKind::Struct),
-                payload_version: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(PAYLOAD_VERSION),
-                payload_json: row.get(3)?,
-                origin: row.get(4)?,
-            });
+            out.push(read_type_row(row)?);
         }
         Ok(out)
     }
@@ -1080,13 +1083,7 @@ impl<'a> ReadSnapshot<'a> {
         let mut rows = statement.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let encoding: String = row.get(1)?;
-            out.push(StringRow {
-                address: Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?,
-                encoding: StringEncoding::parse(&encoding).unwrap_or(StringEncoding::Ascii),
-                bytes: row.get(2)?,
-                text: row.get(3)?,
-            });
+            out.push(read_string_row(row)?);
         }
         Ok(out)
     }
@@ -1203,6 +1200,13 @@ impl<'a> ReadSnapshot<'a> {
             },
         )?;
         let (undo_depth, redo_depth) = self.history_depth()?;
+        let analysis_scope = self.scope()?;
+        let coverage = if analysis_scope.is_empty() {
+            "full"
+        } else {
+            "filtered"
+        };
+        let skipped_functions = self.count_skipped_functions(&analysis_scope)?;
         Ok(DatabaseInfo {
             uuid,
             revision: self.revision,
@@ -1215,7 +1219,7 @@ impl<'a> ReadSnapshot<'a> {
             source_sha256: self.source_sha256()?,
             original_path: self.original_path()?,
             image: self.image()?,
-            function_count: self.functions()?.len(),
+            function_count: self.count_live_functions()?,
             instruction_count: self.count("instructions")?,
             string_count: self.count("strings")?,
             xref_count: self.count("xrefs")?,
@@ -1223,6 +1227,9 @@ impl<'a> ReadSnapshot<'a> {
             debug_sidecars: self.resource_names("dwarf_sidecar")?.len(),
             undo_depth,
             redo_depth,
+            analysis_scope,
+            coverage: coverage.to_string(),
+            skipped_functions,
         })
     }
 
@@ -1313,6 +1320,601 @@ impl<'a> ReadSnapshot<'a> {
         }
         Ok(out)
     }
+
+    // -----------------------------------------------------------------------
+    // Batch readers
+    //
+    // Each method answers one bounded question so a command never has to
+    // materialize a whole table. Address lists are split into disjoint groups
+    // of at most `MAX_ADDRESS_CHUNK` values; a group prepares its statement
+    // once and binds every value.
+    // -----------------------------------------------------------------------
+
+    /// One page of live functions, ordered by address, plus the CFG unit state
+    /// stored for the function under the all-zero config, when such a unit
+    /// exists.
+    pub fn functions_page(&self, limit: usize, offset: usize) -> DbResult<Vec<FunctionListRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.address, f.declared_end, f.bounds_origin, f.origin,
+                    f.excluded, f.user_removed, f.present, u.state
+             FROM functions f
+             LEFT JOIN analysis_units u
+               ON u.image_id = f.image_id
+              AND u.owner_kind = 'function_cfg'
+              AND u.owner_key = f.address
+              AND u.config_fingerprint = ?3
+             WHERE f.image_id = 1 AND f.present = 1 AND f.user_removed = 0
+             ORDER BY f.address
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![
+            page_bound(limit),
+            page_bound(offset),
+            &NO_CONFIG_FINGERPRINT[..]
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let state: Option<String> = row.get(7)?;
+            out.push(FunctionListRow {
+                function: read_function_row(row)?,
+                state: state.and_then(|value| AnalysisState::parse(&value)),
+            });
+        }
+        Ok(out)
+    }
+
+    /// One page of symbols in the order of [`ReadSnapshot::symbols`].
+    pub fn symbols_page(&self, limit: usize, offset: usize) -> DbResult<Vec<SymbolInfo>> {
+        let mut statement = self.conn.prepare(
+            "SELECT address, name, kind, size, origin FROM symbols
+             WHERE image_id = 1 ORDER BY address, name LIMIT ?1 OFFSET ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![page_bound(limit), page_bound(offset)])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_symbol_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// One page of strings in the order of [`ReadSnapshot::strings`].
+    pub fn strings_page(&self, limit: usize, offset: usize) -> DbResult<Vec<StringRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT address, encoding, bytes, decoded_text FROM strings
+             WHERE image_id = 1 ORDER BY address, encoding LIMIT ?1 OFFSET ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![page_bound(limit), page_bound(offset)])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_string_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// One page of user types in the order of [`ReadSnapshot::types`].
+    pub fn types_page(&self, limit: usize, offset: usize) -> DbResult<Vec<TypeRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT name, kind, payload_version, payload_json, origin FROM types
+             WHERE image_id = 1 ORDER BY name, origin LIMIT ?1 OFFSET ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![page_bound(limit), page_bound(offset)])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_type_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// User names at exactly these addresses. Addresses without a row are
+    /// absent from the map.
+    pub fn names_for(&self, addresses: &[Address]) -> DbResult<BTreeMap<Address, String>> {
+        let mut out = BTreeMap::new();
+        for chunk in address_chunks(addresses) {
+            let sql = format!(
+                "SELECT address, value FROM names
+                 WHERE image_id = 1 AND address IN ({})
+                 ORDER BY address",
+                placeholders(chunk.len())
+            );
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(blobs.iter().map(|blob| blob.as_slice())))?;
+            while let Some(row) = rows.next()? {
+                out.insert(Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?, row.get(1)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The preferred symbol row of each requested address: the first row that
+    /// [`ReadSnapshot::symbols`] would surface for it. Addresses without a row
+    /// are absent from the map.
+    pub fn symbols_for(&self, addresses: &[Address]) -> DbResult<BTreeMap<Address, SymbolInfo>> {
+        let mut out = BTreeMap::new();
+        for chunk in address_chunks(addresses) {
+            let sql = format!(
+                "SELECT address, name, kind, size, origin FROM symbols
+                 WHERE image_id = 1 AND address IN ({})
+                 ORDER BY address, name",
+                placeholders(chunk.len())
+            );
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(blobs.iter().map(|blob| blob.as_slice())))?;
+            while let Some(row) = rows.next()? {
+                let symbol = read_symbol_row(row)?;
+                let address = symbol.address;
+                out.entry(address).or_insert(symbol);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Instructions owned by each requested function. A function with no
+    /// instruction row is absent from the map; per-function order matches
+    /// [`ReadSnapshot::instructions`].
+    pub fn instructions_for_functions(
+        &self,
+        functions: &[Address],
+    ) -> DbResult<BTreeMap<Address, Vec<hexray_core::Instruction>>> {
+        let mut out: BTreeMap<Address, Vec<hexray_core::Instruction>> = BTreeMap::new();
+        for chunk in address_chunks(functions) {
+            let sql = format!(
+                "SELECT fi.function_address, i.address, i.payload_json
+                 FROM function_instructions fi
+                 JOIN instructions i
+                   ON i.image_id = fi.image_id AND i.address = fi.instruction_address
+                 WHERE fi.image_id = 1 AND fi.function_address IN ({})
+                 ORDER BY fi.function_address, fi.ordinal, i.address",
+                placeholders(chunk.len())
+            );
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(blobs.iter().map(|blob| blob.as_slice())))?;
+            while let Some(row) = rows.next()? {
+                let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                let address = Address::from_blob(&row.get::<_, Vec<u8>>(1)?)?;
+                let json: String = row.get(2)?;
+                let instruction = serde_json::from_str(&json).map_err(|_| {
+                    DbError::Corrupt(format!(
+                        "instruction payload at {} is not readable",
+                        address.to_hex()
+                    ))
+                })?;
+                out.entry(function).or_default().push(instruction);
+            }
+        }
+        Ok(out)
+    }
+
+    /// CFGs owned by each requested function, with the block/edge/instruction
+    /// order of [`ReadSnapshot::cfg`]. A function with no basic block is
+    /// absent from the map; a CFG is never fabricated.
+    pub fn cfgs_for_functions(
+        &self,
+        functions: &[Address],
+    ) -> DbResult<BTreeMap<Address, CfgData>> {
+        let mut out: BTreeMap<Address, CfgData> = BTreeMap::new();
+        for chunk in address_chunks(functions) {
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let params: Vec<&[u8]> = blobs.iter().map(|blob| blob.as_slice()).collect();
+
+            {
+                let sql = format!(
+                    "SELECT function_address, payload_json FROM basic_blocks
+                     WHERE image_id = 1 AND function_address IN ({})
+                     ORDER BY function_address, block_id",
+                    placeholders(chunk.len())
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(params.iter().copied()))?;
+                while let Some(row) = rows.next()? {
+                    let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                    let json: String = row.get(1)?;
+                    match serde_json::from_str::<BlockPayload>(&json) {
+                        Ok(block) => out.entry(function).or_default().blocks.push(block),
+                        Err(_) => {
+                            return Err(DbError::Corrupt(format!(
+                                "block payload of {} is not readable",
+                                function.to_hex()
+                            )))
+                        }
+                    }
+                }
+            }
+
+            {
+                let sql = format!(
+                    "SELECT function_address, block_id, instruction_address FROM block_instructions
+                     WHERE image_id = 1 AND function_address IN ({})
+                     ORDER BY function_address, block_id, ordinal",
+                    placeholders(chunk.len())
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(params.iter().copied()))?;
+                while let Some(row) = rows.next()? {
+                    let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                    let block_id = u32::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+                    let address = Address::from_blob(&row.get::<_, Vec<u8>>(2)?)?;
+                    let Some(cfg) = out.get_mut(&function) else {
+                        continue;
+                    };
+                    match cfg.block_instructions.last_mut() {
+                        Some((id, list)) if *id == block_id => list.push(address),
+                        _ => cfg.block_instructions.push((block_id, vec![address])),
+                    }
+                }
+            }
+
+            {
+                let sql = format!(
+                    "SELECT function_address, from_block, to_block, kind FROM cfg_edges
+                     WHERE image_id = 1 AND function_address IN ({})
+                     ORDER BY function_address, from_block, to_block, kind",
+                    placeholders(chunk.len())
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(params.iter().copied()))?;
+                while let Some(row) = rows.next()? {
+                    let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                    let from_block = u32::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+                    let to_block = u32::try_from(row.get::<_, i64>(2)?).unwrap_or(0);
+                    let kind =
+                        EdgeKind::parse(&row.get::<_, String>(3)?).unwrap_or(EdgeKind::Normal);
+                    if let Some(cfg) = out.get_mut(&function) {
+                        cfg.edges.push((from_block, to_block, kind));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One page of cross references, ordered by source, target and kind.
+    pub fn xrefs_page(&self, limit: usize, offset: usize) -> DbResult<Vec<XrefRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT from_address, to_address, kind, owner_function, origin FROM xrefs
+             WHERE image_id = 1 ORDER BY from_address, to_address, kind
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![page_bound(limit), page_bound(offset)])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_xref_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Cross references whose source or target is one of `addresses`, ordered
+    /// by source then target. A reference collides only when both ends are
+    /// requested; it is returned once either way.
+    pub fn xrefs_for_addresses(&self, addresses: &[Address]) -> DbResult<Vec<XrefRow>> {
+        let mut out = Vec::new();
+        let mut seen: BTreeSet<XrefKey> = BTreeSet::new();
+        for chunk in address_chunks(addresses) {
+            let sql = format!(
+                "SELECT from_address, to_address, kind, owner_function, origin FROM xrefs
+                 WHERE image_id = 1 AND (from_address IN ({0}) OR to_address IN ({0}))
+                 ORDER BY from_address, to_address",
+                placeholders(chunk.len())
+            );
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(blobs.iter().map(|blob| blob.as_slice())))?;
+            while let Some(row) = rows.next()? {
+                let xref = read_xref_row(row)?;
+                let key = (
+                    xref.from.to_blob(),
+                    xref.to.to_blob(),
+                    xref.kind.as_str().to_string(),
+                    xref.owner.map(|owner| owner.to_blob()),
+                    xref.origin.as_str().to_string(),
+                );
+                if seen.insert(key) {
+                    out.push(xref);
+                }
+            }
+        }
+        out.sort_by(|left, right| {
+            (
+                left.from.0,
+                left.to.0,
+                left.kind.as_str(),
+                left.owner.map(|owner| owner.0),
+                left.origin.as_str(),
+            )
+                .cmp(&(
+                    right.from.0,
+                    right.to.0,
+                    right.kind.as_str(),
+                    right.owner.map(|owner| owner.0),
+                    right.origin.as_str(),
+                ))
+        });
+        Ok(out)
+    }
+
+    /// Call references, optionally restricted to the calls owned by one
+    /// function, ordered by source then target.
+    pub fn call_xrefs(&self, owner: Option<Address>) -> DbResult<Vec<XrefRow>> {
+        let mut out = Vec::new();
+        match owner {
+            Some(owner) => {
+                let mut statement = self.conn.prepare(
+                    "SELECT from_address, to_address, kind, owner_function, origin FROM xrefs
+                     WHERE image_id = 1 AND kind = ?1 AND owner_function = ?2
+                     ORDER BY from_address, to_address",
+                )?;
+                let mut rows = statement.query(rusqlite::params![
+                    XrefKind::Call.as_str(),
+                    &owner.to_blob()[..]
+                ])?;
+                while let Some(row) = rows.next()? {
+                    out.push(read_xref_row(row)?);
+                }
+            }
+            None => {
+                let mut statement = self.conn.prepare(
+                    "SELECT from_address, to_address, kind, owner_function, origin FROM xrefs
+                     WHERE image_id = 1 AND kind = ?1
+                     ORDER BY from_address, to_address",
+                )?;
+                let mut rows = statement.query(rusqlite::params![XrefKind::Call.as_str()])?;
+                while let Some(row) = rows.next()? {
+                    out.push(read_xref_row(row)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Addresses carrying this exact user name, ordered by address.
+    pub fn addresses_for_name(&self, value: &str) -> DbResult<Vec<Address>> {
+        let mut statement = self.conn.prepare(
+            "SELECT address FROM names WHERE image_id = 1 AND value = ?1 ORDER BY address",
+        )?;
+        let mut rows = statement.query(rusqlite::params![value])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?);
+        }
+        Ok(out)
+    }
+
+    /// Addresses carrying this exact symbol name, ordered by address.
+    pub fn addresses_for_symbol(&self, name: &str) -> DbResult<Vec<Address>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT address FROM symbols WHERE image_id = 1 AND name = ?1 ORDER BY address",
+        )?;
+        let mut rows = statement.query(rusqlite::params![name])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?);
+        }
+        Ok(out)
+    }
+
+    /// Functions among `functions` that own at least one instruction row.
+    pub fn functions_with_instructions(
+        &self,
+        functions: &[Address],
+    ) -> DbResult<BTreeSet<Address>> {
+        let mut out = BTreeSet::new();
+        for chunk in address_chunks(functions) {
+            let sql = format!(
+                "SELECT DISTINCT function_address FROM function_instructions
+                 WHERE image_id = 1 AND function_address IN ({})
+                 ORDER BY function_address",
+                placeholders(chunk.len())
+            );
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(blobs.iter().map(|blob| blob.as_slice())))?;
+            while let Some(row) = rows.next()? {
+                out.insert(Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stored payload footprint of each requested function, measured with
+    /// `LENGTH()` so the payload rows themselves are never fetched. Functions
+    /// without any stored artifact are absent from the map.
+    pub fn payload_bytes_for_functions(
+        &self,
+        functions: &[Address],
+    ) -> DbResult<BTreeMap<Address, PayloadBytes>> {
+        let mut out: BTreeMap<Address, PayloadBytes> = BTreeMap::new();
+        for chunk in address_chunks(functions) {
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let params: Vec<&[u8]> = blobs.iter().map(|blob| blob.as_slice()).collect();
+
+            {
+                let sql = format!(
+                    "SELECT fi.function_address, SUM(LENGTH(i.payload_json))
+                     FROM function_instructions fi
+                     JOIN instructions i
+                       ON i.image_id = fi.image_id AND i.address = fi.instruction_address
+                     WHERE fi.image_id = 1 AND fi.function_address IN ({})
+                     GROUP BY fi.function_address",
+                    placeholders(chunk.len())
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(params.iter().copied()))?;
+                while let Some(row) = rows.next()? {
+                    let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                    out.entry(function).or_default().instructions =
+                        u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+                }
+            }
+
+            {
+                let sql = format!(
+                    "SELECT function_address, SUM(LENGTH(payload_json)) FROM basic_blocks
+                     WHERE image_id = 1 AND function_address IN ({})
+                     GROUP BY function_address",
+                    placeholders(chunk.len())
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(params.iter().copied()))?;
+                while let Some(row) = rows.next()? {
+                    let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                    out.entry(function).or_default().cfg =
+                        u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+                }
+            }
+
+            {
+                let sql = format!(
+                    "SELECT function_address, SUM(LENGTH(text)) FROM decompiled
+                     WHERE image_id = 1 AND function_address IN ({})
+                     GROUP BY function_address",
+                    placeholders(chunk.len())
+                );
+                let mut statement = self.conn.prepare(&sql)?;
+                let mut rows =
+                    statement.query(rusqlite::params_from_iter(params.iter().copied()))?;
+                while let Some(row) = rows.next()? {
+                    let function = Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?;
+                    out.entry(function).or_default().render =
+                        u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Functions that already have stored pseudo-C for one render config.
+    pub fn rendered_for(
+        &self,
+        config: &[u8; 32],
+        functions: &[Address],
+    ) -> DbResult<BTreeSet<Address>> {
+        let mut out = BTreeSet::new();
+        for chunk in address_chunks(functions) {
+            let sql = format!(
+                "SELECT DISTINCT function_address FROM decompiled
+                 WHERE image_id = 1 AND function_address IN ({0}) AND config_fingerprint = ?{1}",
+                placeholders(chunk.len()),
+                chunk.len() + 1
+            );
+            let blobs: Vec<[u8; 8]> = chunk.iter().map(|address| address.to_blob()).collect();
+            let mut params: Vec<&[u8]> = blobs.iter().map(|blob| blob.as_slice()).collect();
+            params.push(&config[..]);
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                out.insert(Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Recorded dependencies of the given units, keyed by unit. A unit with no
+    /// dependency row is absent from the map.
+    pub fn dependencies_for_units(
+        &self,
+        keys: &[UnitKey],
+    ) -> DbResult<BTreeMap<UnitKey, Vec<Dependency>>> {
+        let mut out: BTreeMap<UnitKey, Vec<Dependency>> = BTreeMap::new();
+        for chunk in unit_key_chunks(keys) {
+            let sql = format!(
+                "SELECT owner_kind, owner_key, config_fingerprint, dependency_kind,
+                        dependency_key, range_start, range_length, target_generation
+                 FROM analysis_dependencies
+                 WHERE image_id = 1 AND (owner_kind, owner_key, config_fingerprint) IN ({})
+                 ORDER BY owner_kind, owner_key, config_fingerprint",
+                unit_key_placeholders(chunk.len())
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
+            for key in &chunk {
+                params.push(rusqlite::types::Value::Text(
+                    key.owner.as_str().to_string(),
+                ));
+                params.push(rusqlite::types::Value::Blob(key.key.to_blob().to_vec()));
+                params.push(rusqlite::types::Value::Blob(key.config.to_vec()));
+            }
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                // The row-value filter already matched a requested key, so an
+                // unparsable kind cannot correspond to one; skip instead of
+                // inventing a map entry.
+                let Some(owner) = OwnerKind::parse(&row.get::<_, String>(0)?) else {
+                    continue;
+                };
+                let key = UnitKey {
+                    owner,
+                    key: Address::from_blob(&row.get::<_, Vec<u8>>(1)?)?,
+                    config: blob32(row.get(2)?),
+                };
+                let range_start =
+                    Address::from_blob(&row.get::<_, Vec<u8>>(5)?).unwrap_or(Address(0));
+                let range_length = u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+                let dependency = Dependency {
+                    kind: DependencyKind::parse(&row.get::<_, String>(3)?)
+                        .unwrap_or(DependencyKind::Range),
+                    key: row.get(4)?,
+                    range: if range_length > 0 {
+                        AddressRange::new(range_start, range_length).ok()
+                    } else {
+                        None
+                    },
+                    target_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                };
+                out.entry(key).or_default().push(dependency);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The project's current automatic-analysis exclusion policy.
+    ///
+    /// A missing or empty resource row is the empty scope; an unreadable
+    /// payload is `Corrupt`, never a panic.
+    pub fn scope(&self) -> DbResult<AnalysisScope> {
+        read_stored_scope(self.conn)
+    }
+
+    /// Live functions, counted without materializing the rows.
+    fn count_live_functions(&self) -> DbResult<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM functions
+             WHERE image_id = 1 AND present = 1 AND user_removed = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Live function entry addresses inside the merged exclusion intervals.
+    fn count_skipped_functions(&self, scope: &AnalysisScope) -> DbResult<usize> {
+        let mut skipped = 0usize;
+        for (start, end) in scope.merged_intervals() {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM functions
+                 WHERE image_id = 1 AND present = 1 AND user_removed = 0
+                   AND address >= ?1 AND address < ?2",
+                rusqlite::params![
+                    &Address(start).to_blob()[..],
+                    &Address(end).to_blob()[..]
+                ],
+                |row| row.get(0),
+            )?;
+            skipped += usize::try_from(count).unwrap_or(0);
+        }
+        Ok(skipped)
+    }
 }
 
 /// A row of the command log.
@@ -1343,6 +1945,21 @@ impl CfgData {
             .map(|(_, list)| list.as_slice())
             .unwrap_or(&[])
     }
+}
+
+/// One live function row plus the state of its stored CFG unit, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionListRow {
+    pub function: FunctionRow,
+    pub state: Option<AnalysisState>,
+}
+
+/// Stored payload footprint of one function, in bytes of JSON/text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadBytes {
+    pub instructions: u64,
+    pub cfg: u64,
+    pub render: u64,
 }
 
 fn configure_writable(conn: &Connection) -> DbResult<()> {
@@ -1499,6 +2116,25 @@ fn write_initial_content(conn: &Connection, input: &CreateInput) -> DbResult<()>
             "INSERT INTO resources (image_id, kind, logical_name, content_sha256, payload)
              VALUES (1, 'type_snapshot', 'builtin', ?1, ?2)",
             rusqlite::params![&sha256(json.as_bytes())[..], json.as_bytes()],
+        )?;
+    }
+
+    // A non-empty initial policy is part of the created project, not a user
+    // edit: it lands at revision 0 with an empty undo stack. An empty policy
+    // writes no row at all, which reads back as the empty scope.
+    if !input.analysis_scope.is_empty() {
+        input.analysis_scope.validate()?;
+        let payload = serde_json::to_string(&input.analysis_scope)
+            .map_err(|error| DbError::Validation(format!("analysis scope payload: {error}")))?;
+        conn.execute(
+            "INSERT INTO resources (image_id, kind, logical_name, content_sha256, payload)
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                ANALYSIS_SCOPE_RESOURCE_KIND,
+                ANALYSIS_SCOPE_RESOURCE_NAME,
+                &sha256(payload.as_bytes())[..],
+                payload.as_bytes()
+            ],
         )?;
     }
 
@@ -1690,6 +2326,119 @@ fn read_xref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XrefRow> {
             _ => XrefOrigin::Auto,
         },
     })
+}
+
+fn read_symbol_row(row: &rusqlite::Row<'_>) -> DbResult<SymbolInfo> {
+    let origin: String = row.get(4)?;
+    Ok(SymbolInfo {
+        address: Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        size: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+        origin: SymbolOrigin::parse(&origin).unwrap_or(SymbolOrigin::Loader),
+    })
+}
+
+fn read_string_row(row: &rusqlite::Row<'_>) -> DbResult<StringRow> {
+    let encoding: String = row.get(1)?;
+    Ok(StringRow {
+        address: Address::from_blob(&row.get::<_, Vec<u8>>(0)?)?,
+        encoding: StringEncoding::parse(&encoding).unwrap_or(StringEncoding::Ascii),
+        bytes: row.get(2)?,
+        text: row.get(3)?,
+    })
+}
+
+fn read_type_row(row: &rusqlite::Row<'_>) -> DbResult<TypeRow> {
+    Ok(TypeRow {
+        name: row.get(0)?,
+        kind: TypeKind::parse(&row.get::<_, String>(1)?).unwrap_or(TypeKind::Struct),
+        payload_version: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(PAYLOAD_VERSION),
+        payload_json: row.get(3)?,
+        origin: row.get(4)?,
+    })
+}
+
+/// Read and validate the stored analysis-scope resource.
+///
+/// A missing or empty row is the empty scope. Decoding follows the same rules
+/// as the edit path: an unreadable payload is `Corrupt`, an unsupported
+/// payload version is a validation error, and neither is a panic.
+fn read_stored_scope(conn: &Connection) -> DbResult<AnalysisScope> {
+    let payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM resources WHERE image_id = 1 AND kind = ?1 AND logical_name = ?2",
+            rusqlite::params![ANALYSIS_SCOPE_RESOURCE_KIND, ANALYSIS_SCOPE_RESOURCE_NAME],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match payload {
+        None => Ok(AnalysisScope::empty()),
+        Some(bytes) if bytes.is_empty() => Ok(AnalysisScope::empty()),
+        Some(bytes) => {
+            let scope: AnalysisScope = serde_json::from_slice(&bytes).map_err(|error| {
+                DbError::Corrupt(format!("stored analysis scope is unreadable: {error}"))
+            })?;
+            scope.validate()?;
+            Ok(scope)
+        }
+    }
+}
+
+/// Split a caller-supplied address list into disjoint, sorted groups of at
+/// most [`MAX_ADDRESS_CHUNK`] values.
+///
+/// Deduplicating first keeps an address out of two groups, so a chunked `IN`
+/// query can never return one row twice.
+fn address_chunks(addresses: &[Address]) -> Vec<Vec<Address>> {
+    let unique: BTreeSet<Address> = addresses.iter().copied().collect();
+    let values: Vec<Address> = unique.into_iter().collect();
+    values
+        .chunks(MAX_ADDRESS_CHUNK)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
+/// Split a caller-supplied unit-key list into disjoint, sorted groups of at
+/// most [`MAX_ADDRESS_CHUNK`] keys.
+fn unit_key_chunks(keys: &[UnitKey]) -> Vec<Vec<UnitKey>> {
+    let unique: BTreeSet<UnitKey> = keys.iter().copied().collect();
+    let values: Vec<UnitKey> = unique.into_iter().collect();
+    values
+        .chunks(MAX_ADDRESS_CHUNK)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
+/// `(?1, ?2, ?3), (?4, ?5, ?6), ...` for one row-value group per unit key.
+fn unit_key_placeholders(count: usize) -> String {
+    let mut sql = String::new();
+    for group in 0..count {
+        if group > 0 {
+            sql.push_str(", ");
+        }
+        let base = group * 3;
+        sql.push_str(&format!("(?{}, ?{}, ?{})", base + 1, base + 2, base + 3));
+    }
+    sql
+}
+
+/// `?1, ?2, ...` for a statement with `count` bound values.
+fn placeholders(count: usize) -> String {
+    let mut sql = String::new();
+    for index in 1..=count {
+        if index > 1 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        sql.push_str(&index.to_string());
+    }
+    sql
+}
+
+/// Clamp a page window into the SQLite integer range. `LIMIT 0` stays 0.
+fn page_bound(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 /// Create a private temporary directory next to `parent` so staging and
@@ -2237,8 +2986,15 @@ fn publish_function_cfg(tx: &Transaction<'_>, payload: &FunctionCfgPayload) -> D
     }
 
     insert_xrefs(tx, Some(payload.function.address), &payload.xrefs)?;
+    Ok(())
+}
 
-    // Drop instructions that no function references any more.
+/// Drop instructions that no function references any more.
+///
+/// Called once per batch from [`Database::publish`], after every CFG owner in
+/// the batch was replaced and inside the same transaction. A shared tail
+/// instruction is only an orphan once its last owner relationship is gone.
+fn sweep_orphan_instructions(tx: &Transaction<'_>) -> DbResult<()> {
     tx.execute(
         "DELETE FROM instructions
          WHERE image_id = 1
@@ -2446,6 +3202,7 @@ mod tests {
             strings: Vec::new(),
             xrefs: Vec::new(),
             builtin_types_json: None,
+            analysis_scope: AnalysisScope::empty(),
             diagnostics: Vec::new(),
         }
     }

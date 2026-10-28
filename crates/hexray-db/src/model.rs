@@ -1009,6 +1009,143 @@ fn push_field(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+/// One user-declared address range that automatic analysis must not decode.
+///
+/// Half-open in virtual addresses: `[start, end)`. `section_name` is the
+/// user's own label and is display-only — the canonical form of a scope keeps
+/// the numbers, never the label, so renaming a section cannot split a render
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRange {
+    pub start: Address,
+    pub end: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_name: Option<String>,
+}
+
+/// The persisted automatic-analysis range policy of one project.
+///
+/// This is a *user* decision, not an automatic packing verdict: it only limits
+/// which ranges the automatic analysis chain decodes (discovery, CFG, callee
+/// signature seeding, cold-thunk scans). Data reads, xrefs to excluded targets
+/// and explicit temporary queries keep their original semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AnalysisScope {
+    pub payload_version: u32,
+    pub excluded_ranges: Vec<ScopeRange>,
+}
+
+impl AnalysisScope {
+    /// Current payload version. Bump only with a migration.
+    pub const CURRENT_PAYLOAD_VERSION: u32 = 1;
+
+    /// No excluded range: automatic analysis covers the whole image.
+    pub fn empty() -> Self {
+        Self {
+            payload_version: Self::CURRENT_PAYLOAD_VERSION,
+            excluded_ranges: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.excluded_ranges.is_empty()
+    }
+
+    /// Merged `[start, end)` intervals, sorted, adjacent ranges joined.
+    ///
+    /// Overlapping or adjacent user ranges describe one exclusion window, so
+    /// the execution view is the union — never one interval per user range.
+    pub fn merged_intervals(&self) -> Vec<(u64, u64)> {
+        let mut spans: Vec<(u64, u64)> = self
+            .excluded_ranges
+            .iter()
+            .filter(|range| range.end.0 > range.start.0)
+            .map(|range| (range.start.0, range.end.0))
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some((_, last_end)) if start <= *last_end => {
+                    if end > *last_end {
+                        *last_end = end;
+                    }
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
+    /// True when `address` is inside an excluded interval.
+    pub fn contains(&self, address: u64) -> bool {
+        self.merged_intervals()
+            .iter()
+            .any(|(start, end)| address >= *start && address < *end)
+    }
+
+    /// End of the exclusion window containing `address`, if any.
+    pub fn barrier_end(&self, address: u64) -> Option<u64> {
+        self.merged_intervals()
+            .into_iter()
+            .find(|(start, end)| address >= *start && address < *end)
+            .map(|(_, end)| end)
+    }
+
+    /// First excluded address at or after `address`, if any.
+    pub fn next_start(&self, address: u64) -> Option<u64> {
+        self.merged_intervals()
+            .iter()
+            .map(|(start, _)| *start)
+            .find(|start| *start >= address)
+    }
+
+    /// Canonical bytes: payload version plus the merged numeric intervals.
+    ///
+    /// Section labels are deliberately absent: two user ranges that exclude the
+    /// same bytes are the same policy even if they were entered by name.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let spans = self.merged_intervals();
+        let mut out = Vec::with_capacity(8 + spans.len() * 16);
+        out.extend_from_slice(&self.payload_version.to_be_bytes());
+        out.extend_from_slice(&(spans.len() as u64).to_be_bytes());
+        for (start, end) in spans {
+            out.extend_from_slice(&start.to_be_bytes());
+            out.extend_from_slice(&end.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn fingerprint(&self) -> [u8; 32] {
+        crate::sha256(&self.canonical_bytes())
+    }
+
+    /// Reject a payload that cannot come from this engine.
+    pub fn validate(&self) -> Result<(), crate::DbError> {
+        if self.payload_version != Self::CURRENT_PAYLOAD_VERSION {
+            return Err(crate::DbError::Validation(format!(
+                "analysis scope payload version {} is not supported",
+                self.payload_version
+            )));
+        }
+        for range in &self.excluded_ranges {
+            if range.end.0 <= range.start.0 {
+                return Err(crate::DbError::Validation(format!(
+                    "analysis scope range {}..{} is empty or reversed",
+                    range.start.to_hex(),
+                    range.end.to_hex()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resource kind under which the project's [`AnalysisScope`] is stored.
+pub const ANALYSIS_SCOPE_RESOURCE_KIND: &str = "analysis_scope";
+/// Logical name of the single scope resource. A missing row means "empty".
+pub const ANALYSIS_SCOPE_RESOURCE_NAME: &str = "default";
+
 /// Inputs used to create a database.
 #[derive(Debug, Clone)]
 pub struct CreateInput {
@@ -1023,6 +1160,10 @@ pub struct CreateInput {
     pub xrefs: Vec<XrefRow>,
     /// Snapshot of the built-in type database, as JSON.
     pub builtin_types_json: Option<String>,
+    /// Initial automatic-analysis exclusion policy. Written with the initial
+    /// resources at revision 0, so creating a filtered project never consumes
+    /// an undo entry.
+    pub analysis_scope: AnalysisScope,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -1049,6 +1190,14 @@ pub struct DatabaseInfo {
     pub debug_sidecars: usize,
     pub undo_depth: usize,
     pub redo_depth: usize,
+    /// Current automatic-analysis exclusion policy.
+    pub analysis_scope: AnalysisScope,
+    /// `full` when nothing is excluded, `filtered` otherwise.
+    pub coverage: String,
+    /// Function rows whose entry address the scope excludes. This counts
+    /// *known* rows only; it never claims to know how many functions the
+    /// excluded bytes contain.
+    pub skipped_functions: usize,
 }
 
 /// A row of the `changes`/history audit surface.

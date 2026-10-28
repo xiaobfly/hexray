@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod analysis_pipeline;
+mod analysis_scope;
 mod commands;
 mod database;
 mod session;
@@ -2419,7 +2420,7 @@ fn synthesize_signature_function_symbols(
     };
 
     for (address, size, heuristic_bounds) in
-        discover_function_starts(fmt, fmt.architecture(), symbols)
+        discover_function_starts(fmt, fmt.architecture(), symbols, None)
     {
         if has_named_symbol_at(address, symbols) {
             continue;
@@ -3392,6 +3393,75 @@ fn disassemble_cfg(
     Ok(())
 }
 
+/// Decode one bounded window and report why the scan stopped.
+///
+/// This is the single decode core: the discovery pass, the CFG pass and the
+/// callee signature seed all go through it, so "what the decoder saw" cannot
+/// diverge between them. The caller is responsible for clamping the window to
+/// the analysis scope and for caching the result.
+///
+/// `scope_bounded` marks a window whose end is an analysis-scope boundary, not a
+/// natural bound. There, an instruction that does not fit must end the scan:
+/// resynchronising past it would decode the tail of a cut instruction as if it
+/// were a new one, inventing code inside excluded bytes.
+pub(crate) fn disassemble_window(
+    fmt: &dyn BinaryFormat,
+    address: u64,
+    max_bytes: usize,
+    stop_after_first_return: bool,
+    scope_bounded: bool,
+) -> Result<(Vec<hexray_core::Instruction>, crate::analysis_pipeline::DecodeStopReason)> {
+    let bytes = fmt.bytes_at(address, max_bytes).context("Cannot read bytes")?;
+    let (instructions, reason) = match fmt.architecture() {
+        Architecture::X86_64 | Architecture::X86 => {
+            let disasm = X86_64Disassembler::new();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        Architecture::Arm64 => {
+            let disasm = Arm64Disassembler::new();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        Architecture::RiscV64 => {
+            let disasm = RiscVDisassembler::new();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        Architecture::RiscV32 => {
+            let disasm = RiscVDisassembler::new_rv32();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        arch => bail!("Unsupported architecture: {:?}", arch),
+    };
+    Ok((instructions, reason))
+}
+
 fn disassemble_for_cfg<D: Disassembler>(
     disasm: &D,
     fmt: &dyn BinaryFormat,
@@ -3399,11 +3469,26 @@ fn disassemble_for_cfg<D: Disassembler>(
     start_addr: u64,
     stop_after_first_return: bool,
 ) -> Vec<hexray_core::Instruction> {
+    disassemble_for_cfg_detailed(disasm, fmt, bytes, start_addr, stop_after_first_return, false).0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn disassemble_for_cfg_detailed<D: Disassembler>(
+    disasm: &D,
+    fmt: &dyn BinaryFormat,
+    bytes: &[u8],
+    start_addr: u64,
+    stop_after_first_return: bool,
+    scope_bounded: bool,
+) -> (Vec<hexray_core::Instruction>, crate::analysis_pipeline::DecodeStopReason) {
+    use crate::analysis_pipeline::DecodeStopReason;
     let binary_data_ctx = build_binary_data_context(fmt);
     let scan_limit = start_addr.saturating_add(bytes.len() as u64);
     let mut instructions = Vec::new();
     let mut offset = 0;
     let mut min_scan_end = start_addr;
+    let mut stop_reason = DecodeStopReason::RangeEnd;
+    let mut last_decode_failed = false;
 
     while offset < bytes.len() && instructions.len() < 500 {
         let remaining = &bytes[offset..];
@@ -3411,6 +3496,7 @@ fn disassemble_for_cfg<D: Disassembler>(
 
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
+                last_decode_failed = false;
                 let is_ret = decoded.instruction.is_return();
                 let is_halt = matches!(
                     decoded.instruction.control_flow,
@@ -3493,16 +3579,44 @@ fn disassemble_for_cfg<D: Disassembler>(
                     && !must_keep_scanning
                     && (is_ret || is_halt || is_noreturn_call || is_heuristic_tail_jump)
                 {
+                    stop_reason = if is_noreturn_call {
+                        DecodeStopReason::Noreturn
+                    } else if is_heuristic_tail_jump {
+                        DecodeStopReason::TailJump
+                    } else {
+                        DecodeStopReason::Return
+                    };
                     break;
                 }
             }
             Err(_) => {
+                if scope_bounded {
+                    // The window ends at an analysis-scope boundary: the bytes
+                    // that failed here belong to an instruction the user
+                    // excluded, so the scan ends instead of re-synchronising on
+                    // its tail and calling that tail a new instruction.
+                    stop_reason = DecodeStopReason::AnalysisScope;
+                    break;
+                }
+                last_decode_failed = true;
                 offset += disasm.min_instruction_size().max(1);
             }
         }
     }
 
-    instructions
+    if offset >= bytes.len() {
+        if last_decode_failed {
+            stop_reason = DecodeStopReason::InvalidDecode;
+        } else if stop_reason == DecodeStopReason::RangeEnd {
+            // The window itself ran out; this is the ordinary "function is
+            // bigger than the window" case.
+            stop_reason = DecodeStopReason::RangeEnd;
+        }
+    } else if instructions.len() >= 500 {
+        stop_reason = DecodeStopReason::InstructionLimit;
+    }
+
+    (instructions, stop_reason)
 }
 
 fn is_known_noreturn_call_target(
@@ -3619,52 +3733,7 @@ pub(crate) fn disassemble_function_for_cfg(
     max_bytes: usize,
     stop_after_first_return: bool,
 ) -> Result<Vec<hexray_core::Instruction>> {
-    let bytes = fmt
-        .bytes_at(address, max_bytes)
-        .context("Cannot read bytes")?;
-    match fmt.architecture() {
-        Architecture::X86_64 | Architecture::X86 => {
-            let disasm = X86_64Disassembler::new();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        Architecture::Arm64 => {
-            let disasm = Arm64Disassembler::new();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        Architecture::RiscV64 => {
-            let disasm = RiscVDisassembler::new();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        Architecture::RiscV32 => {
-            let disasm = RiscVDisassembler::new_rv32();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        arch => bail!("Unsupported architecture: {:?}", arch),
-    }
+    Ok(disassemble_window(fmt, address, max_bytes, stop_after_first_return, false)?.0)
 }
 
 pub(crate) struct DirectCalleeSignatureSeedContext<'a> {
@@ -3673,6 +3742,17 @@ pub(crate) struct DirectCalleeSignatureSeedContext<'a> {
     calling_convention: hexray_analysis::CallingConvention,
     tls_access_targets: &'a [TlsAccessTarget],
     tls_slot_map: &'a std::collections::HashMap<u64, u64>,
+    /// Raw decodes this command already produced. Callees found here are not
+    /// decoded again; a miss still decodes on demand, so the recovered
+    /// signatures are byte-for-byte the ones the serial baseline produced.
+    decoded: Option<&'a std::collections::HashMap<
+        crate::analysis_pipeline::DecodeKey,
+        Arc<crate::analysis_pipeline::DecodedFunction>,
+    >>,
+    /// Active analysis scope. A callee inside an excluded range is never
+    /// decoded, which is the point of the scope: the caller's own CFG is
+    /// unaffected, only the cross-range seed work disappears.
+    scope: Option<&'a crate::analysis_scope::ScopeMap>,
 }
 
 pub(crate) fn seed_direct_callee_signature_hints(
@@ -3688,10 +3768,39 @@ pub(crate) fn seed_direct_callee_signature_hints(
             stop_after_first_return,
             ..
         } = decompile_target_info_for_address(fmt, None, callee_addr);
-        let Ok(mut callee_instructions) =
-            disassemble_function_for_cfg(fmt, callee_addr, max_bytes, stop_after_first_return)
-        else {
+        let allowed = match seed_ctx.scope {
+            Some(scope) => {
+                let (allowed, _) = scope.clamp_window(callee_addr, max_bytes);
+                allowed
+            }
+            None => max_bytes,
+        };
+        if allowed == 0 {
             continue;
+        }
+        let scope_bounded = allowed != max_bytes;
+        let cached = seed_ctx.decoded.and_then(|table| {
+            let scope = seed_ctx.scope?;
+            let key = crate::analysis_pipeline::decode_key_for(
+                scope,
+                callee_addr,
+                max_bytes,
+                stop_after_first_return,
+            );
+            table.get(&key).cloned()
+        });
+        let mut callee_instructions = match cached {
+            Some(decoded) => decoded.instructions.to_vec(),
+            None => match disassemble_window(
+                fmt,
+                callee_addr,
+                allowed,
+                stop_after_first_return,
+                scope_bounded,
+            ) {
+                Ok((instructions, _)) => instructions,
+                Err(_) => continue,
+            },
         };
         apply_instruction_relocations(&mut callee_instructions, seed_ctx.relocation_table);
         rewrite_tls_memory_operands(
@@ -3727,15 +3836,24 @@ fn decompile_function(
     config: Option<&DecompilerConfig>,
 ) -> Result<()> {
     let debug_info = load_dwarf_info(binary_path, binary);
+    let shared = analysis_pipeline::SharedAnalysisContext::build(
+        binary,
+        analysis_pipeline::SharedTables {
+            project,
+            type_db,
+            debug_info,
+            names: &[],
+            scope: None,
+        },
+    );
     let inputs = analysis_pipeline::AnalysisInputs {
-        project,
-        type_db,
+        shared: &shared,
         config,
         diagnostics,
-        debug_info: debug_info.as_ref(),
         signature_override: None,
         variable_overrides: &[],
-        names: &[],
+        decoded: None,
+        scope_map: None,
     };
     let analyzed = analysis_pipeline::analyze_function(
         binary,
@@ -4217,6 +4335,7 @@ pub(crate) fn collect_throw_thunks(
     binary: &Binary,
     symbol_table: &SymbolTable,
     relocation_table: &RelocationTable,
+    scope: Option<&crate::analysis_scope::ScopeMap>,
 ) -> std::collections::HashMap<u64, String> {
     let fmt = binary.as_format();
     let arch = fmt.architecture();
@@ -4240,7 +4359,16 @@ pub(crate) fn collect_throw_thunks(
         } else {
             256usize
         };
-        let Some(bytes) = fmt.bytes_at(symbol.address, max_bytes) else {
+        // The cold-helper scan is part of the automatic chain: a helper inside
+        // an excluded range is never decoded.
+        let allowed = match scope {
+            Some(scope) => scope.clamp_window(symbol.address, max_bytes).0,
+            None => max_bytes,
+        };
+        if allowed == 0 {
+            continue;
+        }
+        let Some(bytes) = fmt.bytes_at(symbol.address, allowed) else {
             continue;
         };
 
@@ -5690,10 +5818,16 @@ pub(crate) fn collect_noreturn_call_sites(
 // coverage, including partially symbolized CET/IBT binaries. Callers
 // can still layer additional discoveries on top (for example
 // round-6.5's xref call-target seeding).
+//
+// `scope` only limits the whole-range ENDBR sweep: symbol and lifecycle-array
+// seeds are data the caller already owns, and filtering them is the caller's
+// job. Passing `None` keeps the unrestricted behaviour the bare-file commands
+// rely on.
 pub(crate) fn discover_function_starts(
     fmt: &dyn BinaryFormat,
     arch: Architecture,
     symbols: &[hexray_core::Symbol],
+    scope: Option<&crate::analysis_scope::ScopeMap>,
 ) -> Vec<(u64, u64, bool)> {
     let mut starts: Vec<_> = symbols
         .iter()
@@ -5713,7 +5847,7 @@ pub(crate) fn discover_function_starts(
     // (for example dynsym plus a handful of local labels). Always fold in
     // ENDBR-derived starts on x86 so xref/callgraph scans still reach the
     // unsymbolized bodies that make direct calls into PLT stubs.
-    starts.extend(discover_stripped_x86_function_seeds(fmt, arch));
+    starts.extend(discover_stripped_x86_function_seeds(fmt, arch, scope));
 
     starts.extend(
         discover_lifecycle_array_entries(fmt)
@@ -5745,6 +5879,7 @@ pub(crate) fn discover_function_starts(
 fn discover_stripped_x86_function_seeds(
     fmt: &dyn BinaryFormat,
     arch: Architecture,
+    scope: Option<&crate::analysis_scope::ScopeMap>,
 ) -> Vec<(u64, u64, bool)> {
     let pattern: &[u8] = match arch {
         Architecture::X86_64 => &[0xf3, 0x0f, 0x1e, 0xfa],
@@ -5754,15 +5889,31 @@ fn discover_stripped_x86_function_seeds(
 
     let mut seeds = Vec::new();
     for section in fmt.executable_sections() {
-        let starts =
-            discover_endbr_function_starts(section.virtual_address(), section.data(), pattern);
-        for (idx, start) in starts.iter().enumerate() {
-            let end = starts
-                .get(idx + 1)
-                .copied()
-                .unwrap_or_else(|| section.virtual_address().saturating_add(section.size()));
-            let size = end.saturating_sub(*start).max(pattern.len() as u64);
-            seeds.push((*start, size, false));
+        let base = section.virtual_address();
+        let section_end = base.saturating_add(section.size());
+        // Sweep only the bytes the scope leaves included: a fully excluded
+        // section costs nothing, and a partially excluded one is scanned over
+        // its included sub-ranges instead of being scanned and then filtered.
+        let ranges = match scope {
+            Some(scope) => scope.included_ranges(base, section_end),
+            None => vec![(base, section_end)],
+        };
+        for (range_start, range_end) in ranges {
+            let Ok(offset) = usize::try_from(range_start.saturating_sub(base)) else {
+                continue;
+            };
+            let Ok(length) = usize::try_from(range_end.saturating_sub(range_start)) else {
+                continue;
+            };
+            let Some(data) = section.data().get(offset..offset.saturating_add(length)) else {
+                continue;
+            };
+            let starts = discover_endbr_function_starts(range_start, data, pattern);
+            for (idx, start) in starts.iter().enumerate() {
+                let end = starts.get(idx + 1).copied().unwrap_or(range_end);
+                let size = end.saturating_sub(*start).max(pattern.len() as u64);
+                seeds.push((*start, size, false));
+            }
         }
     }
 
@@ -6240,7 +6391,7 @@ fn build_callgraph(
     // Note: Mach-O symbols don't have size info (nlist doesn't store it),
     // so we use a default size for symbols with size == 0
     let functions_to_analyze: Vec<(u64, String, u64, bool)> = if target == "all" {
-        discover_function_starts(fmt, arch, &symbols)
+        discover_function_starts(fmt, arch, &symbols, None)
             .into_iter()
             .map(|(addr, size, heuristic_bounds)| {
                 let name = find_preferred_symbol_at(&symbols, addr)
@@ -6820,7 +6971,6 @@ fn decompile_with_follow(
     use std::collections::HashSet;
 
     let fmt = binary.as_format();
-    let arch = fmt.architecture();
     let relocation_table = build_relocation_table(binary);
 
     // Track which functions we've already decompiled to avoid duplicates
@@ -6835,28 +6985,20 @@ fn decompile_with_follow(
 
     queue.push((start_addr, name, 0));
 
-    // Build tables once for all decompilations
-    let string_table = build_string_table(fmt);
-    let mut symbol_table = build_symbol_table(binary);
-    // Merge project function names into symbol table
-    if let Some(proj) = project {
-        for addr in proj.overridden_functions() {
-            if let Some(name) = proj.get_function_name(addr) {
-                symbol_table.insert(addr, name.to_string());
-            }
-        }
-    }
-    let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
-    let binary_data_ctx = build_binary_data_context(fmt);
-    let tls_access_targets = build_tls_access_targets(binary);
-    let tls_symbol_offsets = build_tls_symbol_offset_map(binary);
-    let tls_slot_map = build_tls_slot_map(binary);
-
-    // Create constant database for magic number recognition
-    let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
-
-    // Try to load DWARF debug info once
+    // Every image-wide table is built once, through the same constructor the
+    // database path uses.
     let debug_info = load_dwarf_info(binary_path, binary);
+    let shared = analysis_pipeline::SharedAnalysisContext::build(
+        binary,
+        analysis_pipeline::SharedTables {
+            project,
+            type_db,
+            debug_info,
+            names: &[],
+            scope: None,
+        },
+    );
+    let overlay = analysis_pipeline::CommentOverlay::from_project(project);
 
     while let Some((func_addr, func_name, depth)) = queue.pop() {
         if decompiled.contains(&func_addr) {
@@ -6890,102 +7032,57 @@ fn decompile_with_follow(
             func_name, func_addr, depth
         );
 
-        // Disassemble
         let DecompileTargetInfo {
             max_bytes,
             stop_after_first_return,
             ..
         } = decompile_target_info_for_address(fmt, project, func_addr);
-
-        let bytes = match fmt.bytes_at(func_addr, max_bytes) {
-            Some(b) => b,
-            None => continue,
+        let Ok((instructions, _)) =
+            disassemble_window(fmt, func_addr, max_bytes, stop_after_first_return, false)
+        else {
+            continue;
         };
+        let instructions: std::sync::Arc<[hexray_core::Instruction]> = instructions.into();
 
-        let mut instructions = match arch {
-            Architecture::X86_64 | Architecture::X86 => {
-                let disasm = X86_64Disassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            Architecture::Arm64 => {
-                let disasm = Arm64Disassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            Architecture::RiscV64 => {
-                let disasm = RiscVDisassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            Architecture::RiscV32 => {
-                let disasm = RiscVDisassembler::new_rv32();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            _ => continue,
+        let inputs = analysis_pipeline::AnalysisInputs {
+            shared: &shared,
+            config,
+            diagnostics,
+            signature_override: None,
+            variable_overrides: &[],
+            decoded: None,
+            scope_map: None,
         };
-        apply_instruction_relocations(&mut instructions, &relocation_table);
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
-        let noreturn_call_sites =
-            collect_noreturn_call_sites(&instructions, fmt, &relocation_table);
-
-        // Build CFG
-        let cfg = CfgBuilder::build_with_binary_context_and_noreturn_calls(
-            &instructions,
+        let analyzed = match analysis_pipeline::analyze_decoded(
+            binary,
             func_addr,
-            &binary_data_ctx,
-            &noreturn_call_sites,
-        );
-
-        // Get DWARF variable and parameter names for this function.
-        let dwarf_names = if let Some(ref di) = debug_info {
-            get_dwarf_function_names(di, func_addr, binary)
-        } else {
-            DwarfFunctionNames::default()
-        };
-
-        // Decompile
-        let calling_convention = default_calling_convention(
-            match binary {
-                Binary::Elf(_) => BinaryType::Elf,
-                Binary::MachO(_) => BinaryType::MachO,
-                Binary::Pe(_) => BinaryType::Pe,
+            func_name.clone(),
+            None,
+            max_bytes,
+            stop_after_first_return,
+            &analysis_pipeline::DecodedFunction {
+                instructions,
+                decoded_end: func_addr,
+                stop_reason: analysis_pipeline::DecodeStopReason::RangeEnd,
             },
-            arch,
-        );
-        let mut decompiler = Decompiler::new()
-            .with_addresses(show_addresses)
-            .with_string_table(string_table.clone())
-            .with_symbol_table(symbol_table.clone())
-            .with_relocation_table(relocation_table.clone())
-            .with_tls_symbol_offsets(tls_symbol_offsets.clone())
-            .with_throw_thunks(throw_thunks.clone())
-            .with_dwarf_names(dwarf_names.stack_names)
-            .with_dwarf_param_names(dwarf_names.parameter_names)
-            .with_dwarf_scope_ranges(dwarf_names.local_scope_ranges)
-            .with_constant_database(const_db.clone())
-            .with_struct_inference(true)
-            .with_calling_convention(calling_convention);
-        decompiler = decompiler.analyze_cpp_special(&cfg, &instructions, Some(&func_name));
-        if let Some(info) = binary.exception_info_for_function(func_addr, func_addr, &relocation_table) {
-            decompiler = decompiler.with_exception_info(info);
-        }
-        if let Some(db) = type_db {
-            decompiler = decompiler.with_type_database(db.clone());
-        }
-        if let Some(cfg_opts) = config {
-            decompiler = decompiler.with_config(cfg_opts.clone());
-        }
-        if diagnostics {
-            let signature = decompiler.recover_signature(&cfg);
-            print_signature_diagnostics(&func_name, &signature);
-        }
-        let pseudocode = analysis_pipeline::ensure_nonempty_pseudocode(
-            analysis_pipeline::apply_comment_overlay(
-                decompiler.decompile(&cfg, &func_name),
-                Some(&analysis_pipeline::CommentOverlay::from_project(project)),
+            &inputs,
+        ) {
+            Ok(analyzed) => analyzed,
+            Err(error) => {
+                eprintln!("error: {error}");
+                continue;
+            }
+        };
+        let instructions = analyzed.instructions.clone();
+        let rendered = analysis_pipeline::render_function(
+            analyzed,
+            &analysis_pipeline::RenderOptions {
                 show_addresses,
-            ),
-        );
+                comments: Some(overlay.clone()),
+            },
+        )?;
 
-        println!("{}", pseudocode);
+        println!("{}", rendered.text);
 
         // If we haven't reached max depth, find internal calls to follow
         if depth < max_depth {
@@ -7244,7 +7341,7 @@ fn build_xrefs(
     // Start from the same function-start seeds used by `callgraph all`, then
     // also walk discovered internal callees so stripped callers still
     // contribute xrefs.
-    let functions_to_analyze = discover_function_starts(fmt, arch, &symbols);
+    let functions_to_analyze = discover_function_starts(fmt, arch, &symbols, None);
 
     let is_internal_code = |addr: u64| -> bool {
         fmt.executable_sections().any(|sec| {
@@ -7415,7 +7512,7 @@ fn build_xrefs(
         // real functions and would otherwise dominate the lookup, so we
         // exclude anything starting with __mh_.
         let mut function_starts: Vec<(u64, Option<String>, u64)> =
-            discover_function_starts(fmt, arch, &symbols)
+            discover_function_starts(fmt, arch, &symbols, None)
                 .into_iter()
                 .filter_map(|(addr, size, _)| {
                     let symbol = fmt.symbol_at(addr);
@@ -9111,7 +9208,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
                 let relocations = build_relocation_table(binary);
-                let throw_thunks = collect_throw_thunks(binary, &symbols, &relocations);
+                let throw_thunks = collect_throw_thunks(binary, &symbols, &relocations, None);
                 let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
                 let calling_convention = default_calling_convention(
                     match binary {
@@ -10937,7 +11034,7 @@ mod tests {
             entry_point: None,
         };
 
-        let seeds = discover_stripped_x86_function_seeds(&binary, Architecture::X86_64);
+        let seeds = discover_stripped_x86_function_seeds(&binary, Architecture::X86_64, None);
 
         assert_eq!(seeds, vec![(0x401020, 8, false), (0x401028, 6, false)]);
     }
@@ -10959,7 +11056,7 @@ mod tests {
             entry_point: Some(0x401000),
         };
 
-        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols);
+        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols, None);
 
         assert_eq!(
             starts,
@@ -10998,7 +11095,7 @@ mod tests {
             entry_point: None,
         };
 
-        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols);
+        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols, None);
 
         assert!(starts.iter().any(|(addr, _, _)| *addr == 0x401156));
         assert!(starts.iter().any(|(addr, _, _)| *addr == 0x401193));

@@ -210,7 +210,7 @@ fn scan_function_symbols<'a>(
     let mut seen = std::collections::HashSet::new();
 
     for (address, size, heuristic_bounds) in
-        crate::discover_function_starts(fmt, fmt.architecture(), &symbols)
+        crate::discover_function_starts(fmt, fmt.architecture(), &symbols, None)
     {
         if !seen.insert(address) {
             continue;

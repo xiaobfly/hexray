@@ -122,7 +122,10 @@ pub struct CleanupInfo {
 #[derive(Debug, Clone)]
 pub struct BinaryDataContext {
     /// Pairs of (base_address, data) for each data section.
-    sections: Vec<(u64, Vec<u8>)>,
+    ///
+    /// Section bytes are shared by reference: cloning the context (once per
+    /// function/decompiler) copies the `Arc` handles, not the section data.
+    sections: Vec<(u64, Arc<[u8]>)>,
     /// Best-effort fixed-arity hints for direct/internal call targets keyed by name.
     call_signature_hints_by_name: HashMap<String, usize>,
     /// Best-effort fixed-arity hints for direct/internal call targets keyed by address.
@@ -190,6 +193,15 @@ impl BinaryDataContext {
 
     /// Adds a data section.
     pub fn add_section(&mut self, base: u64, data: Vec<u8>) {
+        self.sections.push((base, Arc::from(data)));
+    }
+
+    /// Adds a data section whose bytes are already shared.
+    ///
+    /// Use this when many [`BinaryDataContext`] values (one per function or
+    /// per decompiler) must see the same section bytes; neither this call nor
+    /// a later `clone()` copies the bytes.
+    pub fn add_section_arc(&mut self, base: u64, data: Arc<[u8]>) {
         self.sections.push((base, data));
     }
 
@@ -215,14 +227,14 @@ impl BinaryDataContext {
     pub fn section_containing(&self, addr: u64) -> Option<(&[u8], u64)> {
         for (base, data) in &self.sections {
             if addr >= *base && addr < *base + data.len() as u64 {
-                return Some((data, *base));
+                return Some((&data[..], *base));
             }
         }
         None
     }
 
     /// Returns an iterator over all sections.
-    pub fn sections(&self) -> impl Iterator<Item = &(u64, Vec<u8>)> {
+    pub fn sections(&self) -> impl Iterator<Item = &(u64, Arc<[u8]>)> {
         self.sections.iter()
     }
 
@@ -1084,11 +1096,14 @@ pub struct Decompiler {
     /// Indentation string (default: 4 spaces).
     pub indent: String,
     /// String table for resolving addresses.
-    pub string_table: Option<StringTable>,
+    ///
+    /// Shared by `Arc`: an image-wide table is built once per command and
+    /// every per-function decompiler references it.
+    pub string_table: Option<Arc<StringTable>>,
     /// Symbol table for resolving function addresses.
-    pub symbol_table: Option<SymbolTable>,
+    pub symbol_table: Option<Arc<SymbolTable>>,
     /// Relocation table for resolving call targets in relocatable files.
-    pub relocation_table: Option<RelocationTable>,
+    pub relocation_table: Option<Arc<RelocationTable>>,
     /// Type information for variables (var_name -> type_string).
     /// Comes from type inference analysis.
     pub type_info: HashMap<String, String>,
@@ -1139,11 +1154,11 @@ pub struct Decompiler {
     /// review on PR #26 pass 5.
     pub binary_data: Option<Arc<BinaryDataContext>>,
     /// Split cold helper targets whose bodies end in C++ throw/rethrow machinery.
-    pub throw_thunks: HashMap<u64, String>,
+    pub throw_thunks: Arc<HashMap<u64, String>>,
     /// Symbol kind for the current function when known.
     pub current_function_kind: Option<SymbolKind>,
     /// Thread-pointer-relative TLS symbol names keyed by byte offset.
-    pub tls_symbol_offsets: HashMap<i64, String>,
+    pub tls_symbol_offsets: Arc<HashMap<i64, String>>,
     /// Explicit function signature override.
     ///
     /// When set it outranks C++-adjusted and automatically recovered
@@ -1180,9 +1195,9 @@ impl Default for Decompiler {
             config: None,
             summary_database: None,
             binary_data: None,
-            throw_thunks: HashMap::new(),
+            throw_thunks: Arc::new(HashMap::new()),
             current_function_kind: None,
-            tls_symbol_offsets: HashMap::new(),
+            tls_symbol_offsets: Arc::new(HashMap::new()),
             signature_override: None,
             variable_overrides: Vec::new(),
         }
@@ -1212,24 +1227,51 @@ impl Decompiler {
 
     /// Sets the string table for resolving addresses to strings.
     pub fn with_string_table(mut self, table: StringTable) -> Self {
+        self.string_table = Some(Arc::new(table));
+        self
+    }
+
+    /// Sets the string table from an already shared table.
+    ///
+    /// Use this when many decompilers (one per rendered function) reference
+    /// the same image-wide table.
+    pub fn with_string_table_arc(mut self, table: Arc<StringTable>) -> Self {
         self.string_table = Some(table);
         self
     }
 
     /// Sets the symbol table for resolving function addresses.
     pub fn with_symbol_table(mut self, table: SymbolTable) -> Self {
+        self.symbol_table = Some(Arc::new(table));
+        self
+    }
+
+    /// Sets the symbol table from an already shared table.
+    pub fn with_symbol_table_arc(mut self, table: Arc<SymbolTable>) -> Self {
         self.symbol_table = Some(table);
         self
     }
 
     /// Sets the relocation table for resolving call targets.
     pub fn with_relocation_table(mut self, table: RelocationTable) -> Self {
+        self.relocation_table = Some(Arc::new(table));
+        self
+    }
+
+    /// Sets the relocation table from an already shared table.
+    pub fn with_relocation_table_arc(mut self, table: Arc<RelocationTable>) -> Self {
         self.relocation_table = Some(table);
         self
     }
 
     /// Sets known cold-split throw thunk targets.
     pub fn with_throw_thunks(mut self, throw_thunks: HashMap<u64, String>) -> Self {
+        self.throw_thunks = Arc::new(throw_thunks);
+        self
+    }
+
+    /// Sets known cold-split throw thunk targets from an already shared map.
+    pub fn with_throw_thunks_arc(mut self, throw_thunks: Arc<HashMap<u64, String>>) -> Self {
         self.throw_thunks = throw_thunks;
         self
     }
@@ -1242,6 +1284,12 @@ impl Decompiler {
 
     /// Sets thread-pointer-relative TLS symbol names keyed by byte offset.
     pub fn with_tls_symbol_offsets(mut self, offsets: HashMap<i64, String>) -> Self {
+        self.tls_symbol_offsets = Arc::new(offsets);
+        self
+    }
+
+    /// Sets thread-pointer-relative TLS symbol names from an already shared map.
+    pub fn with_tls_symbol_offsets_arc(mut self, offsets: Arc<HashMap<i64, String>>) -> Self {
         self.tls_symbol_offsets = offsets;
         self
     }
@@ -1502,7 +1550,7 @@ impl Decompiler {
         let coro_rewritten = if coroutine::is_coroutine_resume_clone(func_name) {
             coroutine_cfg::rewrite_clang_resume_dispatch(
                 cfg,
-                self.relocation_table.as_ref(),
+                self.relocation_table.as_deref(),
                 self.binary_data.as_deref(),
             )
         } else {
@@ -1699,10 +1747,10 @@ impl Decompiler {
         // conflicting hint can never demote an explicit override.
         self.seed_override_parameter_types(&mut merged_types);
         let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
-            .with_string_table(self.string_table.clone())
-            .with_symbol_table(self.symbol_table.clone())
-            .with_relocation_table(self.relocation_table.clone())
-            .with_tls_symbol_offsets(self.tls_symbol_offsets.clone())
+            .with_string_table_arc(self.string_table.clone())
+            .with_symbol_table_arc(self.symbol_table.clone())
+            .with_relocation_table_arc(self.relocation_table.clone())
+            .with_tls_symbol_offsets_arc(self.tls_symbol_offsets.clone())
             .with_type_info(merged_types)
             .with_dwarf_names(self.dwarf_names.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())
@@ -1738,9 +1786,9 @@ impl Decompiler {
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else if self.enable_signature_recovery {
             let signature = SignatureRecovery::new(self.calling_convention)
-                .with_binary_data(self.binary_data.as_deref())
-                .with_relocation_table(self.relocation_table.clone())
-                .with_symbol_table(self.symbol_table.clone())
+                .with_binary_data_arc(self.binary_data.clone())
+                .with_relocation_table_arc(self.relocation_table.clone())
+                .with_symbol_table_arc(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
                 .with_dwarf_param_names(self.dwarf_param_names.clone())
                 .with_current_function_kind(self.current_function_kind)
@@ -2815,9 +2863,9 @@ impl Decompiler {
 
         let structured = self.structure(cfg);
         let mut recovery = SignatureRecovery::new(self.calling_convention)
-            .with_binary_data(self.binary_data.as_deref())
-            .with_relocation_table(self.relocation_table.clone())
-            .with_symbol_table(self.symbol_table.clone())
+            .with_binary_data_arc(self.binary_data.clone())
+            .with_relocation_table_arc(self.relocation_table.clone())
+            .with_symbol_table_arc(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())
             .with_current_function_kind(self.current_function_kind)
@@ -2854,11 +2902,13 @@ impl Decompiler {
         coroutine_targets: &[hexray_core::BasicBlockId],
     ) -> StructuredCfg {
         let noreturn_targets = collect_known_noreturn_targets(
-            self.symbol_table.as_ref(),
-            self.relocation_table.as_ref(),
+            self.symbol_table.as_deref(),
+            self.relocation_table.as_deref(),
         );
-        let ubsan_targets =
-            collect_known_ubsan_targets(self.symbol_table.as_ref(), self.relocation_table.as_ref());
+        let ubsan_targets = collect_known_ubsan_targets(
+            self.symbol_table.as_deref(),
+            self.relocation_table.as_deref(),
+        );
         // When LSDA exception info is available, augment the CFG with unwind edges
         // (block -> landing pad) so the structurer can recover try/catch shape.
         // Functions without exception info are untouched (no clone, no edges).
@@ -2878,7 +2928,7 @@ impl Decompiler {
                 self.exception_info.as_ref(),
                 &noreturn_targets,
                 &ubsan_targets,
-                &self.throw_thunks,
+                self.throw_thunks.as_ref(),
                 coroutine_targets,
             )
         } else {
@@ -2889,7 +2939,7 @@ impl Decompiler {
                 self.exception_info.as_ref(),
                 &noreturn_targets,
                 &ubsan_targets,
-                &self.throw_thunks,
+                self.throw_thunks.as_ref(),
                 coroutine_targets,
             )
         }
@@ -2983,9 +3033,9 @@ impl Decompiler {
 
         // Emit pseudo-code
         let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
-            .with_string_table(self.string_table.clone())
-            .with_symbol_table(self.symbol_table.clone())
-            .with_relocation_table(self.relocation_table.clone())
+            .with_string_table_arc(self.string_table.clone())
+            .with_symbol_table_arc(self.symbol_table.clone())
+            .with_relocation_table_arc(self.relocation_table.clone())
             .with_type_info(self.type_info.clone())
             .with_dwarf_names(self.dwarf_names.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())

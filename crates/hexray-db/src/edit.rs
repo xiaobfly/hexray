@@ -105,6 +105,14 @@ pub enum Edit {
         address: Address,
         locator: Option<VariableLocator>,
     },
+    /// Replace the project's automatic-analysis exclusion policy as a whole.
+    ///
+    /// This is a user edit like any other: it bumps the revision, lands in the
+    /// undo history, and invalidates the automatic analysis. An empty scope
+    /// clears the policy.
+    SetAnalysisScope {
+        scope: AnalysisScope,
+    },
 }
 
 /// What a `clear`/`remove` command targets. Selecting the kind is mandatory:
@@ -169,6 +177,7 @@ impl Edit {
                 OverrideTarget::Type => "clear-type",
                 OverrideTarget::Variable => "clear-variable",
             },
+            Self::SetAnalysisScope { .. } => "scope",
         }
     }
 }
@@ -230,6 +239,11 @@ pub enum InverseOp {
     DeleteVariableOverride {
         function: Address,
         locator_json: String,
+    },
+    /// Restore the analysis-scope resource exactly: `None` means the row did
+    /// not exist before the edit, so undo deletes it again.
+    RestoreAnalysisScope {
+        previous_payload: Option<String>,
     },
 }
 
@@ -316,6 +330,7 @@ pub fn apply(tx: &Transaction<'_>, edit: &Edit) -> DbResult<EditResult> {
             address,
             locator,
         } => apply_remove_override(tx, *target, *address, locator.as_ref()),
+        Edit::SetAnalysisScope { scope } => apply_analysis_scope(tx, scope),
     }
 }
 
@@ -456,6 +471,9 @@ pub fn apply_inverse(tx: &Transaction<'_>, inverse: &[InverseOp]) -> DbResult<()
                      WHERE image_id = 1 AND function_address = ?1 AND locator_json = ?2",
                     rusqlite::params![&function.to_blob()[..], locator_json],
                 )?;
+            }
+            InverseOp::RestoreAnalysisScope { previous_payload } => {
+                write_scope_resource(tx, previous_payload.as_deref())?;
             }
         }
     }
@@ -1309,6 +1327,97 @@ fn apply_remove_override(
 }
 
 // ---------------------------------------------------------------------------
+// Analysis scope
+// ---------------------------------------------------------------------------
+
+/// Read the stored scope payload, if the project has one.
+fn read_scope_resource(tx: &Transaction<'_>) -> DbResult<Option<Vec<u8>>> {
+    Ok(tx
+        .query_row(
+            "SELECT payload FROM resources WHERE image_id = 1 AND kind = ?1 AND logical_name = ?2",
+            rusqlite::params![
+                ANALYSIS_SCOPE_RESOURCE_KIND,
+                ANALYSIS_SCOPE_RESOURCE_NAME
+            ],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Decode a stored scope payload. A missing row is the empty scope.
+fn decode_scope_payload(payload: Option<&[u8]>) -> DbResult<AnalysisScope> {
+    match payload {
+        None => Ok(AnalysisScope::empty()),
+        Some(bytes) => {
+            if bytes.is_empty() {
+                return Ok(AnalysisScope::empty());
+            }
+            let scope: AnalysisScope = serde_json::from_slice(bytes).map_err(|error| {
+                DbError::Corrupt(format!("stored analysis scope is unreadable: {error}"))
+            })?;
+            scope.validate()?;
+            Ok(scope)
+        }
+    }
+}
+
+/// Write or delete the scope resource. `None` deletes the row, which is how a
+/// project that never had a scope gets restored exactly.
+fn write_scope_resource(tx: &Transaction<'_>, payload: Option<&str>) -> DbResult<()> {
+    match payload {
+        Some(text) => {
+            // Re-validate on the way back in: an inverse payload is data from
+            // the log, not trusted code.
+            let scope: AnalysisScope = serde_json::from_str(text).map_err(|error| {
+                DbError::Corrupt(format!("stored analysis scope is unreadable: {error}"))
+            })?;
+            scope.validate()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO resources
+                    (image_id, kind, logical_name, content_sha256, payload)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    ANALYSIS_SCOPE_RESOURCE_KIND,
+                    ANALYSIS_SCOPE_RESOURCE_NAME,
+                    &crate::sha256(text.as_bytes())[..],
+                    text.as_bytes()
+                ],
+            )?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM resources WHERE image_id = 1 AND kind = ?1 AND logical_name = ?2",
+                rusqlite::params![
+                    ANALYSIS_SCOPE_RESOURCE_KIND,
+                    ANALYSIS_SCOPE_RESOURCE_NAME
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace the analysis-scope policy. Canonically equal payloads are a no-op,
+/// so re-declaring the same exclusions never burns a revision or an undo step.
+fn apply_analysis_scope(tx: &Transaction<'_>, scope: &AnalysisScope) -> DbResult<EditResult> {
+    scope.validate()?;
+    let previous = read_scope_resource(tx)?;
+    let current = decode_scope_payload(previous.as_deref())?;
+    if current.canonical_bytes() == scope.canonical_bytes() {
+        return Ok(EditResult::unchanged());
+    }
+    let payload = serde_json::to_string(scope)
+        .map_err(|error| DbError::Validation(format!("analysis scope payload: {error}")))?;
+    write_scope_resource(tx, Some(&payload))?;
+    Ok(EditResult::changed(vec![
+        InverseOp::RestoreAnalysisScope {
+            previous_payload: previous
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        },
+    ]))
+}
+
+// ---------------------------------------------------------------------------
 // Invalidation
 // ---------------------------------------------------------------------------
 
@@ -1474,6 +1583,20 @@ pub fn invalidate(tx: &Transaction<'_>, edit: &Edit, revision: Revision) -> DbRe
         }
         Edit::RemoveType { name } => {
             type_names.insert(name.clone());
+        }
+        Edit::SetAnalysisScope { .. } => {
+            // A scope change redefines which ranges the automatic chain may
+            // decode. Cross-range dependencies (a caller in `.text` seeding a
+            // callee in `.packed`) are not modelled precisely enough to spare
+            // anything, so the conservative answer is: every automatic artifact
+            // is stale. User overrides, bytes and earlier rendered text are
+            // kept — they are still the last thing the engine saw.
+            tx.execute(
+                "UPDATE analysis_units SET state = 'stale'
+                 WHERE image_id = 1 AND state <> 'pending'",
+                [],
+            )?;
+            return Ok(());
         }
     }
 

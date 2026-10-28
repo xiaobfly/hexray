@@ -312,6 +312,7 @@ pub fn create_project_with_abi(abi: AbiInfo) -> Project {
         strings: vec![sample_string()],
         xrefs: Vec::new(),
         builtin_types_json: Some("{}".into()),
+        analysis_scope: AnalysisScope::empty(),
         diagnostics: Vec::new(),
     };
     let database = Database::create(&db_path, &input).expect("create database");

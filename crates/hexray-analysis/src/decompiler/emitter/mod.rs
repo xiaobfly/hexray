@@ -382,11 +382,13 @@ impl GlobalAccessTracker {
 pub struct PseudoCodeEmitter {
     indent: String,
     emit_addresses: bool,
-    string_table: Option<StringTable>,
-    symbol_table: Option<SymbolTable>,
-    relocation_table: Option<RelocationTable>,
+    /// Image-wide read-only tables, shared by `Arc` so building an emitter
+    /// per rendered function never copies them.
+    string_table: Option<Arc<StringTable>>,
+    symbol_table: Option<Arc<SymbolTable>>,
+    relocation_table: Option<Arc<RelocationTable>>,
     gnu_version_ambiguous_bases: RefCell<Option<HashSet<String>>>,
-    tls_symbol_offsets: HashMap<i64, String>,
+    tls_symbol_offsets: Arc<HashMap<i64, String>>,
     /// Type information for variables (var_name -> type_string).
     type_info: std::collections::HashMap<String, String>,
     /// DWARF variable names (stack_offset -> name).
@@ -760,7 +762,7 @@ impl PseudoCodeEmitter {
             symbol_table: None,
             relocation_table: None,
             gnu_version_ambiguous_bases: RefCell::new(None),
-            tls_symbol_offsets: HashMap::new(),
+            tls_symbol_offsets: Arc::new(HashMap::new()),
             type_info: std::collections::HashMap::new(),
             dwarf_names: std::collections::HashMap::new(),
             dwarf_param_names: Vec::new(),
@@ -2589,7 +2591,7 @@ impl PseudoCodeEmitter {
 
     fn is_guarded_stack_canary_branch(&self, condition: &Expr, body: &[StructuredNode]) -> bool {
         Self::expr_mentions_stack_canary_guard(condition)
-            && is_stack_canary_check_body(body, self.symbol_table.as_ref())
+            && is_stack_canary_check_body(body, self.symbol_table.as_deref())
     }
 
     fn rewrite_small_aggregate_slots_for_emission(
@@ -4148,12 +4150,25 @@ impl PseudoCodeEmitter {
 
     /// Sets the string table for resolving addresses.
     pub fn with_string_table(mut self, table: Option<StringTable>) -> Self {
+        self.string_table = table.map(Arc::new);
+        self
+    }
+
+    /// Sets the string table from an already shared table.
+    pub fn with_string_table_arc(mut self, table: Option<Arc<StringTable>>) -> Self {
         self.string_table = table;
         self
     }
 
     /// Sets the symbol table for resolving function addresses.
     pub fn with_symbol_table(mut self, table: Option<SymbolTable>) -> Self {
+        self.symbol_table = table.map(Arc::new);
+        *self.gnu_version_ambiguous_bases.borrow_mut() = None;
+        self
+    }
+
+    /// Sets the symbol table from an already shared table.
+    pub fn with_symbol_table_arc(mut self, table: Option<Arc<SymbolTable>>) -> Self {
         self.symbol_table = table;
         *self.gnu_version_ambiguous_bases.borrow_mut() = None;
         self
@@ -4161,6 +4176,13 @@ impl PseudoCodeEmitter {
 
     /// Sets the relocation table for resolving call targets in relocatable files.
     pub fn with_relocation_table(mut self, table: Option<RelocationTable>) -> Self {
+        self.relocation_table = table.map(Arc::new);
+        *self.gnu_version_ambiguous_bases.borrow_mut() = None;
+        self
+    }
+
+    /// Sets the relocation table from an already shared table.
+    pub fn with_relocation_table_arc(mut self, table: Option<Arc<RelocationTable>>) -> Self {
         self.relocation_table = table;
         *self.gnu_version_ambiguous_bases.borrow_mut() = None;
         self
@@ -4168,6 +4190,12 @@ impl PseudoCodeEmitter {
 
     /// Sets thread-pointer-relative TLS symbol names keyed by byte offset.
     pub fn with_tls_symbol_offsets(mut self, offsets: HashMap<i64, String>) -> Self {
+        self.tls_symbol_offsets = Arc::new(offsets);
+        self
+    }
+
+    /// Sets thread-pointer-relative TLS symbol names from an already shared map.
+    pub fn with_tls_symbol_offsets_arc(mut self, offsets: Arc<HashMap<i64, String>>) -> Self {
         self.tls_symbol_offsets = offsets;
         self
     }
@@ -4848,7 +4876,7 @@ impl PseudoCodeEmitter {
         // Always use format_expr_with_strings for stack slot resolution and DWARF names
         // The string table is optional - we pass an empty one if not available
         let empty = super::StringTable::new();
-        let table = self.string_table.as_ref().unwrap_or(&empty);
+        let table = self.string_table.as_deref().unwrap_or(&empty);
         self.format_expr_with_strings(expr, table)
     }
 
@@ -7395,8 +7423,8 @@ impl PseudoCodeEmitter {
         // Use advanced signature recovery if enabled
         let signature = if self.use_signature_recovery {
             let mut recovery = SignatureRecovery::new(self.calling_convention)
-                .with_relocation_table(self.relocation_table.clone())
-                .with_symbol_table(self.symbol_table.clone())
+                .with_relocation_table_arc(self.relocation_table.clone())
+                .with_symbol_table_arc(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
                 .with_dwarf_param_names(self.dwarf_param_names.clone())
                 .with_function_name(func_name);
@@ -8036,8 +8064,8 @@ impl PseudoCodeEmitter {
         func_name: Option<&str>,
     ) -> FunctionSignature {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
-            .with_relocation_table(self.relocation_table.clone())
-            .with_symbol_table(self.symbol_table.clone())
+            .with_relocation_table_arc(self.relocation_table.clone())
+            .with_symbol_table_arc(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone());
         if let Some(name) = func_name {
