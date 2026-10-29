@@ -4501,7 +4501,13 @@ pub(crate) fn seed_resolved_call_target_names(
         binary_data_ctx.add_call_target_name_by_address(address, name);
     }
 
-    for (call_site, relocation) in relocation_table.call_relocations() {
+    // HashMap iteration order is per-process random, so when several call
+    // sites share a target address the last-wins name would differ between
+    // runs. Sorting by call site makes that choice deterministic.
+    let mut call_relocations: Vec<_> = relocation_table.call_relocations().collect();
+    call_relocations.sort_by_key(|(call_site, _)| *call_site);
+
+    for (call_site, relocation) in call_relocations {
         binary_data_ctx.add_call_target_name_by_call_site(call_site, relocation.symbol.clone());
         if relocation.target_addr != 0 {
             binary_data_ctx
@@ -9991,12 +9997,13 @@ mod tests {
         patch_affects_function, resolve_analysis_target, resolve_analysis_target_with_entry_main,
         resolve_materialized_callback_targets, resolve_relocatable_elf_personality,
         resolve_relocation_symbol, resolve_xref_source_label, resolve_xref_target_addresses,
-        string_tags, truncate_for_display, DiffPatchAddressSpace, FileAddressRange,
-        ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
+        seed_resolved_call_target_names, string_tags, truncate_for_display,
+        DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat,
+        SymbolLookupMode,
     };
     use hexray_analysis::{
-        CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
-        XrefType,
+        BinaryDataContext, CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable,
+        StringEncoding, SymbolTable, XrefType,
     };
     use hexray_core::{
         register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
@@ -12468,5 +12475,39 @@ mod tests {
         assert_eq!(resolved.name.as_deref(), Some("__gxx_personality_v0"));
         assert_eq!(resolved.addr, 0);
         assert!(resolved.resolved_via_relocation);
+    }
+
+    #[test]
+    fn seed_resolved_call_target_names_is_independent_of_hashmap_order() {
+        let forward = {
+            let mut table = RelocationTable::new();
+            table.insert_call(0x1010, "callee_from_low_site".to_string(), 0x5000, false);
+            table.insert_call(0x2020, "callee_from_high_site".to_string(), 0x5000, false);
+            table
+        };
+        let reversed = {
+            let mut table = RelocationTable::new();
+            table.insert_call(0x2020, "callee_from_high_site".to_string(), 0x5000, false);
+            table.insert_call(0x1010, "callee_from_low_site".to_string(), 0x5000, false);
+            table
+        };
+
+        for table in [forward, reversed] {
+            let mut ctx = BinaryDataContext::new();
+            seed_resolved_call_target_names(&mut ctx, &SymbolTable::new(), &table);
+            // Sorted seeding lets the highest call site own the shared target name.
+            assert_eq!(
+                ctx.call_target_name_by_address(0x5000),
+                Some("callee_from_high_site")
+            );
+            assert_eq!(
+                ctx.call_target_name_by_call_site(0x1010),
+                Some("callee_from_low_site")
+            );
+            assert_eq!(
+                ctx.call_target_name_by_call_site(0x2020),
+                Some("callee_from_high_site")
+            );
+        }
     }
 }
