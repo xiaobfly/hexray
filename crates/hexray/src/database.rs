@@ -2369,8 +2369,12 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
         request.force || !index_current || !snapshot.functions.iter().any(|f| f.is_live());
 
     let discovery_started = std::time::Instant::now();
+    let mut discovery_truncated = false;
     let mut discovered: Vec<FunctionRow> = if need_discovery {
-        discovery_pass(binary, &snapshot, &mut decode)?
+        let (functions, truncated) =
+            discovery_pass(binary, &snapshot, &mut decode, MAX_DISCOVERED_FUNCTIONS)?;
+        discovery_truncated = truncated;
+        functions
     } else {
         snapshot.functions.clone()
     };
@@ -2441,12 +2445,22 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
                 ),
             ));
         }
+        if discovery_truncated {
+            diagnostics.push(Diagnostic::new(
+                "discovery-truncated",
+                Severity::Warning,
+                format!(
+                    "function discovery stopped at {MAX_DISCOVERED_FUNCTIONS}; the project is \
+                     only partially discovered"
+                ),
+            ));
+        }
         let unit = UnitPublish {
             key: index_key,
             expected_generation: snapshot.unit_generation(&index_key),
             // No discovered function is not a complete analysis either: report
             // it as partial so `db info` never claims a finished project.
-            state: if gpu || function_count == 0 || scope_active {
+            state: if gpu || function_count == 0 || scope_active || discovery_truncated {
                 AnalysisState::Partial
             } else {
                 AnalysisState::Current
@@ -3400,7 +3414,8 @@ fn discovery_pass(
     binary: &Binary<'_>,
     snapshot: &AnalysisSnapshot,
     decode: &mut DecodeSession,
-) -> Result<Vec<FunctionRow>> {
+    max_functions: usize,
+) -> Result<(Vec<FunctionRow>, bool)> {
     let fmt = binary.as_format();
     let in_scope = |address: u64| snapshot.scope_map.contains(address);
     if !supports_pseudo_c(fmt.architecture()) {
@@ -3414,8 +3429,10 @@ fn discovery_pass(
             .map(|row| row.address.0)
             .collect();
         let mut found: BTreeMap<u64, FunctionRow> = BTreeMap::new();
+        let mut truncated = false;
         for (address, size) in gpu_function_starts(binary) {
-            if found.len() >= MAX_DISCOVERED_FUNCTIONS {
+            if found.len() >= max_functions {
+                truncated = true;
                 break;
             }
             if address == 0 || suppressed.contains(&address) || in_scope(address) {
@@ -3455,7 +3472,7 @@ fn discovery_pass(
                 .entry(function.address.0)
                 .or_insert_with(|| function.clone());
         }
-        return Ok(found.into_values().collect());
+        return Ok((found.into_values().collect(), truncated));
     }
     let relocation_table = crate::build_relocation_table(binary);
     let symbols = crate::collect_analysis_symbols(binary, &relocation_table);
@@ -3476,11 +3493,13 @@ fn discovery_pass(
         .collect();
 
     let mut found: BTreeMap<u64, FunctionRow> = BTreeMap::new();
+    let mut truncated = false;
     let mut queue: VecDeque<(u64, u64, bool)> = starts.iter().copied().collect();
     let mut visited: BTreeSet<u64> = BTreeSet::new();
 
     while let Some((address, size, heuristic)) = queue.pop_front() {
-        if found.len() >= MAX_DISCOVERED_FUNCTIONS {
+        if found.len() >= max_functions {
+            truncated = true;
             break;
         }
         if address == 0 || !visited.insert(address) {
@@ -3539,7 +3558,7 @@ fn discovery_pass(
             .or_insert_with(|| function.clone());
     }
 
-    Ok(found.into_values().collect())
+    Ok((found.into_values().collect(), truncated))
 }
 
 fn function_row_for(
@@ -6620,6 +6639,42 @@ mod tests {
             timings.decodes,
             live
         );
+    }
+
+    #[test]
+    fn discovery_reports_truncation() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (database, _layout) = build_project(directory.path(), 8);
+        let mut database = db(Database::open(&database, OpenMode::ReadOnly)).expect("open");
+        let snapshot = load_snapshot(&mut database).expect("snapshot");
+        let parsed = parse_image(
+            snapshot.image_bytes(),
+            &selection_from_image(&snapshot.image),
+        )
+        .expect("parse fixture");
+        let mut decode = DecodeSession::new(
+            snapshot.scope_map.clone(),
+            parsed.binary.as_format().architecture(),
+        );
+
+        let (capped, truncated) =
+            discovery_pass(&parsed.binary, &snapshot, &mut decode, 3).expect("discovery");
+        assert!(truncated, "a cap below the function count must be reported");
+        assert!(
+            capped.len() <= 3,
+            "discovery must stop at the cap: {}",
+            capped.len()
+        );
+
+        let (all, complete) = discovery_pass(
+            &parsed.binary,
+            &snapshot,
+            &mut decode,
+            MAX_DISCOVERED_FUNCTIONS,
+        )
+        .expect("discovery");
+        assert!(!complete, "the fixture fits under the real cap");
+        assert!(all.len() > capped.len(), "the real cap discovers more");
     }
 
     #[test]
