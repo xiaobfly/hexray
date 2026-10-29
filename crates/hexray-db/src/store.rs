@@ -268,18 +268,16 @@ impl Database {
                 actual: current.0,
             });
         }
-        let mut replaced_cfg = false;
+        let mut orphan_candidates: BTreeSet<Address> = BTreeSet::new();
         for unit in &batch.units {
-            if matches!(&unit.payload, AnalysisPayload::FunctionCfg(_)) {
-                replaced_cfg = true;
-            }
-            publish_unit(&tx, unit)?;
+            publish_unit(&tx, unit, &mut orphan_candidates)?;
         }
-        // Two owners may share a tail instruction. Sweep only once every CFG
-        // owner in this batch has been replaced, inside the same transaction,
-        // so the row is judged an orphan against the batch's final state.
-        // Index-only and render-only batches never touch instruction rows.
-        if replaced_cfg {
+        // Two owners may share a tail instruction, so the sweep stays global
+        // and inside the same transaction: a row is judged an orphan against
+        // the batch's final state. It only runs when a republished function
+        // dropped ownership of some address; a batch that keeps every row
+        // unchanged (or touches no instruction rows at all) skips it.
+        if !orphan_candidates.is_empty() {
             sweep_orphan_instructions(&tx)?;
         }
         tx.commit()?;
@@ -2695,7 +2693,11 @@ fn enforce_history_budget(tx: &Transaction<'_>) -> DbResult<()> {
     Ok(())
 }
 
-fn publish_unit(tx: &Transaction<'_>, unit: &UnitPublish) -> DbResult<()> {
+fn publish_unit(
+    tx: &Transaction<'_>,
+    unit: &UnitPublish,
+    orphan_candidates: &mut BTreeSet<Address>,
+) -> DbResult<()> {
     if unit.payload.owner() != unit.key.owner {
         return Err(DbError::Validation(format!(
             "unit {} carries a {} payload",
@@ -2798,7 +2800,9 @@ fn publish_unit(tx: &Transaction<'_>, unit: &UnitPublish) -> DbResult<()> {
 
     match &unit.payload {
         AnalysisPayload::ImageIndex(payload) => publish_image_index(tx, payload, generation)?,
-        AnalysisPayload::FunctionCfg(payload) => publish_function_cfg(tx, payload)?,
+        AnalysisPayload::FunctionCfg(payload) => {
+            publish_function_cfg(tx, payload, orphan_candidates)?;
+        }
         AnalysisPayload::FunctionRender(payload) => {
             publish_render(tx, payload, generation, unit.state)?;
         }
@@ -2859,7 +2863,11 @@ fn publish_image_index(
     Ok(())
 }
 
-fn publish_function_cfg(tx: &Transaction<'_>, payload: &FunctionCfgPayload) -> DbResult<()> {
+fn publish_function_cfg(
+    tx: &Transaction<'_>,
+    payload: &FunctionCfgPayload,
+    orphan_candidates: &mut BTreeSet<Address>,
+) -> DbResult<()> {
     let function = &payload.function;
     tx.execute(
         "INSERT INTO functions (image_id, address, declared_end, bounds_origin, origin,
@@ -2881,6 +2889,27 @@ fn publish_function_cfg(tx: &Transaction<'_>, payload: &FunctionCfgPayload) -> D
     )?;
 
     let function_blob = function.address.to_blob();
+    // Only addresses this function stops owning can become orphans; the sweep
+    // itself stays global because another owner may still reference them.
+    let mut statement = tx.prepare(
+        "SELECT instruction_address FROM function_instructions
+         WHERE image_id = 1 AND function_address = ?1",
+    )?;
+    let old_blobs: Vec<Vec<u8>> = statement
+        .query_map(rusqlite::params![&function_blob[..]], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let new_addresses: BTreeSet<Address> = payload
+        .instructions
+        .iter()
+        .map(|instruction| Address(instruction.address))
+        .collect();
+    orphan_candidates.extend(
+        old_blobs
+            .iter()
+            .filter_map(|blob| Address::from_blob(blob).ok())
+            .filter(|address| !new_addresses.contains(address)),
+    );
     tx.execute(
         "DELETE FROM function_instructions WHERE image_id = 1 AND function_address = ?1",
         rusqlite::params![&function_blob[..]],
@@ -2996,8 +3025,9 @@ fn publish_function_cfg(tx: &Transaction<'_>, payload: &FunctionCfgPayload) -> D
 
 /// Drop instructions that no function references any more.
 ///
-/// Called once per batch from [`Database::publish`], after every CFG owner in
-/// the batch was replaced and inside the same transaction. A shared tail
+/// Called once per batch from [`Database::publish`], inside the same
+/// transaction, when some republished function dropped ownership of an
+/// instruction. The statement itself stays global so a shared tail
 /// instruction is only an orphan once its last owner relationship is gone.
 fn sweep_orphan_instructions(tx: &Transaction<'_>) -> DbResult<()> {
     tx.execute(

@@ -504,6 +504,59 @@ fn render_and_index_publishes_never_sweep_instructions() {
     );
 }
 
+/// Republishing an identical CFG deletes and reinserts the same ownership
+/// rows, so the function drops no instruction: the batch has no orphan
+/// candidates and the global sweep stays out of the transaction.
+#[test]
+fn republishing_an_unchanged_cfg_leaves_unowned_rows_alone() {
+    let project = create_project();
+    let mut db = project.open();
+    let revision = revision_of(&db);
+
+    let instructions = || {
+        vec![
+            sequential_instruction(ENTRY_A),
+            sequential_instruction(SHARED_TAIL),
+        ]
+    };
+    publish_units(
+        &mut db,
+        revision,
+        vec![cfg_unit(main_function(), instructions(), None)],
+    );
+
+    // A row that no function references, inserted directly so a stray sweep
+    // would collect it.
+    let orphan = Address(0x7777);
+    {
+        let conn = raw_connection(&project.db_path);
+        let payload = serde_json::to_string(&sequential_instruction(orphan)).expect("json");
+        conn.execute(
+            "INSERT INTO instructions (image_id, address, size, payload_version, payload_json)
+             VALUES (1, ?1, 4, 1, ?2)",
+            rusqlite::params![&orphan.to_blob()[..], payload],
+        )
+        .expect("insert orphan instruction");
+    }
+
+    // The same payload again: old minus new ownership is empty.
+    publish_units(
+        &mut db,
+        revision,
+        vec![cfg_unit(main_function(), instructions(), Some(1))],
+    );
+
+    assert!(
+        has_instruction_row(&project, orphan),
+        "an unchanged republish never sweeps instruction rows"
+    );
+    assert_eq!(
+        instruction_rows(&project),
+        vec![ENTRY_A, SHARED_TAIL, orphan],
+        "the function's instruction rows and the unowned row survive"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Paging equivalence with the whole-table readers
 // ---------------------------------------------------------------------------
