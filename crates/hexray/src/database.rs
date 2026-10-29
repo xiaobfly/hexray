@@ -2344,7 +2344,6 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
     let context_started = std::time::Instant::now();
     let type_database = project_type_database(&snapshot, binary)?;
     let debug_info = load_project_dwarf(&snapshot, fmt)?;
-    let project = crate::AnalysisProject::new(&snapshot.image.selector_json).ok();
     let name_pairs: Vec<(u64, String)> = snapshot
         .names
         .iter()
@@ -2353,7 +2352,9 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
     let shared = SharedAnalysisContext::build(
         binary,
         SharedTables {
-            project: project.as_ref(),
+            // The database already carries the user names; the `.hxproj`
+            // overlay is a bare-file CLI feature.
+            project: None,
             type_db: Some(&type_database),
             debug_info,
             names: &name_pairs,
@@ -2627,7 +2628,14 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
                 let PreparedDecode::Decoded(decoded) = prepared else {
                     continue;
                 };
-                for (target, _) in crate::extract_internal_call_targets(&decoded.instructions, fmt) {
+                // Scan the same instructions the workers analyze. The raw
+                // decode still carries the PLT stub for a PLT32-relocated
+                // internal call; applying the relocations here resolves it to
+                // the real callee, which the stub filter would otherwise drop
+                // and every worker would then decode locally.
+                let mut relocated = decoded.instructions.to_vec();
+                crate::apply_call_relocations(&mut relocated, &shared.relocation_table);
+                for (target, _) in crate::extract_internal_call_targets(&relocated, fmt) {
                     if !callees.insert(target) || in_scope(target) {
                         continue;
                     }
