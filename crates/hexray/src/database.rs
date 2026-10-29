@@ -48,7 +48,8 @@ use serde_json::json;
 /// How one command may spend CPU and extra working memory.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct AnalysisExecutionOptions {
-    /// Worker threads: 0 = one per available core, 1 = serial, up to 256
+    /// Worker threads: 0 = one per available core, 1 = serial, up to 256;
+    /// a value above the core count is clamped to it
     #[arg(
         short = 'j',
         long,
@@ -96,13 +97,16 @@ const MAX_BATCH_FUNCTIONS: usize = 128;
 impl AnalysisExecutionOptions {
     /// 0 means "one per available core".
     pub(crate) fn requested_jobs(&self) -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
         if self.jobs == 0 {
-            std::thread::available_parallelism()
-                .map(|count| count.get())
-                .unwrap_or(1)
-                .clamp(1, MAX_JOBS)
+            cores
         } else {
-            (self.jobs as usize).clamp(1, MAX_JOBS)
+            // The work is CPU-bound: workers past the core count only reserve a
+            // 32 MiB stack each and contend the allocator, so an explicit value
+            // above the machine is clamped to it.
+            (self.jobs as usize).clamp(1, MAX_JOBS).min(cores)
         }
     }
 
@@ -125,7 +129,8 @@ impl AnalysisExecutionOptions {
 /// may appear after the subcommand (`db query db.hxdb decompile main --jobs 4`).
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GlobalAnalysisOptions {
-    /// Worker threads: 0 = one per available core, 1 = serial, up to 256
+    /// Worker threads: 0 = one per available core, 1 = serial, up to 256;
+    /// a value above the core count is clamped to it
     #[arg(
         short = 'j',
         long,
@@ -721,6 +726,29 @@ pub(crate) fn handle(action: DbAction) -> Result<()> {
 /// exit class (3 for revision conflicts, 4 for lock/resource limits).
 fn db<T>(result: Result<T, DbError>) -> Result<T> {
     result.map_err(anyhow::Error::new)
+}
+
+/// Publish one analysis batch, retrying while SQLite is busy.
+///
+/// A busy `publish` has already rolled back, so retrying the same batch with
+/// the same base revision is safe: another process's *analysis* would instead
+/// surface as a generation conflict.
+fn publish_batch(database: &mut Database, revision: Revision, batch: &AnalysisBatch) -> Result<()> {
+    const RETRIES: usize = 30;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    for attempt in 0..=RETRIES {
+        match database.publish(revision, batch) {
+            Ok(()) => return Ok(()),
+            Err(DbError::Busy(error)) if attempt < RETRIES => {
+                if attempt == 0 {
+                    eprintln!("waiting for a concurrent reader to release {error}");
+                }
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("the retry loop returns on the last attempt")
 }
 
 // ---------------------------------------------------------------------------
@@ -2429,7 +2457,7 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
             payload: AnalysisPayload::ImageIndex(Box::new(payload)),
         };
         let publish_started = std::time::Instant::now();
-        db(database.publish(revision, &AnalysisBatch { units: vec![unit] }))?;
+        publish_batch(database, revision, &AnalysisBatch { units: vec![unit] })?;
         stage.publish_ms += publish_started.elapsed().as_millis();
     }
 
@@ -2740,7 +2768,7 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
             let published_now: Vec<Address> = units.iter().map(|unit| unit.key.key).collect();
             // A whole batch in one transaction: the orphan-instruction sweep
             // then runs once per batch, after every owner in it was replaced.
-            db(database.publish(revision, &AnalysisBatch { units }))?;
+            publish_batch(database, revision, &AnalysisBatch { units })?;
             republished_targets.extend(published_now);
             stage.publish_ms += publish_started.elapsed().as_millis();
             // The batch is stored; its decoded CFGs are only dead weight now
@@ -3865,7 +3893,7 @@ fn render_functions(
             });
         }
         if !batch.units.is_empty() {
-            db(database.publish(snapshot.revision, &batch))?;
+            publish_batch(database, snapshot.revision, &batch)?;
         }
         stage.render_ms += started.elapsed().as_millis();
         return Ok(RenderReport {
@@ -4002,7 +4030,7 @@ fn render_functions(
         report.partial += partial;
         if !units.is_empty() {
             let publish_started = std::time::Instant::now();
-            db(database.publish(snapshot.revision, &AnalysisBatch { units }))?;
+            publish_batch(database, snapshot.revision, &AnalysisBatch { units })?;
             stage.publish_ms += publish_started.elapsed().as_millis();
         }
     }
@@ -6629,6 +6657,32 @@ mod tests {
                 false_target: BasicBlockId(1),
             },
             "edge deduplication must not rewrite the terminator"
+        );
+    }
+
+    #[test]
+    fn jobs_are_clamped_to_the_core_count() {
+        let cores = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        let serial = AnalysisExecutionOptions {
+            jobs: 1,
+            ..Default::default()
+        };
+        assert_eq!(serial.requested_jobs(), 1, "1 stays serial");
+        let oversized = AnalysisExecutionOptions {
+            jobs: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            oversized.requested_jobs(),
+            cores.min(MAX_JOBS),
+            "an explicit count above the machine is clamped to the core count"
+        );
+        assert_eq!(
+            AnalysisExecutionOptions::default().requested_jobs(),
+            cores,
+            "0 means one worker per available core"
         );
     }
 }
