@@ -15,7 +15,7 @@
 //! Nothing here prints. The CLI decides what to show, and the database decides
 //! what to keep.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -402,12 +402,21 @@ pub(crate) struct DecodedFunction {
 /// The cache stores *raw* instructions. Relocations and TLS rewriting are still
 /// applied per consumer, and no caller's signature hints or CFG are shared, so
 /// the per-caller accumulation order of the baseline is preserved.
+///
+/// It is also bounded by bytes: past `budget_bytes` the oldest decodes are
+/// evicted (FIFO), so a long run does not pin every function it ever decoded.
 pub(crate) struct DecodeSession {
     scope: ScopeMap,
     architecture: hexray_core::Architecture,
     cache: HashMap<DecodeKey, Arc<DecodedFunction>>,
     decodes: usize,
     hits: usize,
+    /// Insertion order for FIFO eviction once `cached_bytes` exceeds the budget.
+    order: VecDeque<DecodeKey>,
+    /// Approximate bytes held by `cache`; see `estimate_decoded_bytes`.
+    cached_bytes: usize,
+    /// Upper bound on `cached_bytes`; exceeding it evicts the oldest decodes.
+    budget_bytes: usize,
 }
 
 /// Key for one decode window under `scope`.
@@ -434,13 +443,28 @@ pub(crate) fn decode_key_for(
 }
 
 impl DecodeSession {
+    /// Unbounded session, for tests that do not exercise eviction.
+    #[cfg(test)]
     pub(crate) fn new(scope: ScopeMap, architecture: hexray_core::Architecture) -> Self {
+        Self::with_budget(scope, architecture, usize::MAX)
+    }
+
+    /// A session that keeps at most `budget_bytes` of decoded functions, evicting
+    /// the oldest decodes past that. `usize::MAX` keeps everything.
+    pub(crate) fn with_budget(
+        scope: ScopeMap,
+        architecture: hexray_core::Architecture,
+        budget_bytes: usize,
+    ) -> Self {
         Self {
             scope,
             architecture,
             cache: HashMap::new(),
             decodes: 0,
             hits: 0,
+            order: VecDeque::new(),
+            cached_bytes: 0,
+            budget_bytes,
         }
     }
 
@@ -519,7 +543,7 @@ impl DecodeSession {
             })
         };
         self.decodes += 1;
-        self.cache.insert(key, decoded.clone());
+        self.store(key, decoded.clone());
         Ok(decoded)
     }
 
@@ -542,12 +566,35 @@ impl DecodeSession {
         &self.cache
     }
 
-    /// Drop the decoded functions held for this batch. The caller hands the
-    /// table to the workers and then publishes, so nothing needs them again;
-    /// keeping them would pin the whole image outside the memory budget.
-    pub(crate) fn clear(&mut self) {
-        self.cache.clear();
+    /// Cache one decode, evicting the oldest entries while over budget.
+    ///
+    /// Eviction is FIFO, not LRU: the access pattern is one serial pre-decode
+    /// pass per batch, so insertion order is close enough and a touch on every
+    /// hit would cost more than it saves.
+    fn store(&mut self, key: DecodeKey, decoded: Arc<DecodedFunction>) {
+        let bytes = estimate_decoded_bytes(&decoded);
+        self.cached_bytes = self.cached_bytes.saturating_add(bytes);
+        self.order.push_back(key);
+        self.cache.insert(key, decoded);
+        while self.cached_bytes > self.budget_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.cache.remove(&oldest) {
+                self.cached_bytes = self
+                    .cached_bytes
+                    .saturating_sub(estimate_decoded_bytes(&entry));
+            }
+        }
     }
+}
+
+/// Lower-bound size of one cached decode: the struct plus the instruction
+/// array. Strings and operand vectors are not counted, so the real footprint
+/// can be larger; the budget is an order-of-magnitude guard, not accounting.
+fn estimate_decoded_bytes(decoded: &DecodedFunction) -> usize {
+    std::mem::size_of::<DecodedFunction>()
+        + decoded.instructions.len() * std::mem::size_of::<Instruction>()
 }
 
 /// Analyze a function by resolving `request.target` in `binary`.

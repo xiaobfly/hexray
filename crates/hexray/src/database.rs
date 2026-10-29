@@ -2338,8 +2338,14 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
     let mut report = AnalyzeReport::default();
 
     // One decode cache for the whole command: discovery, CFG analysis and
-    // callee seeding all share it, so the same bytes are decoded once.
-    let mut decode = DecodeSession::new(snapshot.scope_map.clone(), fmt.architecture());
+    // callee seeding all share it, so the same bytes are decoded once. It is
+    // bounded by the analysis memory budget and evicts oldest-first, so holding
+    // decodes across batches costs throughput far less than re-decoding callees.
+    let mut decode = DecodeSession::with_budget(
+        snapshot.scope_map.clone(),
+        fmt.architecture(),
+        request.exec.budget_bytes() as usize,
+    );
 
     let context_started = std::time::Instant::now();
     let type_database = project_type_database(&snapshot, binary)?;
@@ -2793,9 +2799,6 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
             publish_batch(database, revision, &AnalysisBatch { units })?;
             republished_targets.extend(published_now);
             stage.publish_ms += publish_started.elapsed().as_millis();
-            // The batch is stored; its decoded CFGs are only dead weight now
-            // and would otherwise pin every function the command decoded.
-            decode.clear();
         }
     }
     stage.cfg_ms = cfg_started.elapsed().as_millis();
@@ -6519,6 +6522,62 @@ mod tests {
         );
         assert_eq!(narrow.instructions.len(), direct.instructions.len());
         assert_eq!(narrow.stop_reason, direct.stop_reason);
+    }
+
+    #[test]
+    fn decode_cache_is_bounded_by_its_budget() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let source = directory.path().join("fixture.bin");
+        let layout = fixture::write_analysis_fixture(&source, 8).expect("write fixture");
+        let bytes = std::fs::read(&source).expect("read fixture");
+        let selection = ImageSelection {
+            container_kind: ContainerKind::Elf,
+            container_offset: 0,
+            container_length: bytes.len() as u64,
+            member_name: None,
+            member_index: None,
+            slice_label: None,
+            selector_json: "{\"image\":\"elf\"}".to_string(),
+        };
+        let parsed = parse_image(&bytes, &selection).expect("parse fixture");
+        let arch = parsed.binary.as_format().architecture();
+
+        // A zero budget cannot hold anything: the decode still happens and the
+        // result is still usable, it just is not retained.
+        let mut starved =
+            DecodeSession::with_budget(ScopeMap::from_scope(&AnalysisScope::empty()), arch, 0);
+        let decoded = starved
+            .decode(&parsed.binary, layout.helper, 64, false)
+            .expect("zero-budget decode");
+        assert_eq!(starved.decodes(), 1, "a zero budget must not skip the decode");
+        assert!(
+            starved.table().is_empty(),
+            "a zero budget must evict the entry it just cached: {} entries",
+            starved.table().len()
+        );
+        assert!(
+            !decoded.instructions.is_empty(),
+            "the returned decode must stay usable after eviction"
+        );
+
+        // An unbounded budget keeps the decode, so the repeat is a hit.
+        let mut unbounded = DecodeSession::with_budget(
+            ScopeMap::from_scope(&AnalysisScope::empty()),
+            arch,
+            usize::MAX,
+        );
+        unbounded
+            .decode(&parsed.binary, layout.helper, 64, false)
+            .expect("first unbounded decode");
+        unbounded
+            .decode(&parsed.binary, layout.helper, 64, false)
+            .expect("second unbounded decode");
+        assert_eq!(
+            unbounded.table().len(),
+            1,
+            "an unbounded budget keeps the one window it decoded"
+        );
+        assert_eq!(unbounded.hits(), 1, "the repeat request is a cache hit");
     }
 
     #[test]
