@@ -446,6 +446,90 @@ fn shell_batch_mode_applies_edits() {
 }
 
 #[test]
+fn branch_to_its_own_fallthrough_publishes_once() {
+    let project = Project::create();
+
+    // `je +0` is a conditional branch whose target *is* the fallthrough: the
+    // CFG records the same `from -> to` transfer twice. That must not abort the
+    // analysis transaction (the edge table is a set), and the stored CFG must
+    // show the transfer once.
+    expect_success(&project.edit(&["patch", "0x401000", "7400c3"]));
+    let analyzed = expect_success(&run(&[
+        "db",
+        "analyze",
+        project.db_str(),
+        "--force",
+        "--jobs",
+        "1",
+    ]));
+    assert!(
+        analyzed.contains("Analyzed"),
+        "analysis must complete after the patch: {analyzed}"
+    );
+
+    let cfg: serde_json::Value = serde_json::from_str(&expect_success(
+        &project.query(&["cfg", "_start", "--json"]),
+    ))
+    .expect("cfg json");
+    let blocks = cfg["blocks"].as_array().expect("blocks array");
+    let block_id_at = |start: &str| {
+        blocks
+            .iter()
+            .find(|block| block["start"].as_str() == Some(start))
+            .map(|block| block["id"].as_u64().expect("block id"))
+            .unwrap_or_else(|| panic!("no block starts at {start}: {blocks:?}"))
+    };
+    let src = block_id_at("0x401000");
+    let dst = block_id_at("0x401002");
+    assert_ne!(
+        src, dst,
+        "the branch and its fallthrough must be separate blocks: {blocks:?}"
+    );
+
+    let edges = cfg["edges"].as_array().expect("edges array");
+    let normal = edges
+        .iter()
+        .filter(|edge| {
+            edge[0].as_u64() == Some(src)
+                && edge[1].as_u64() == Some(dst)
+                && edge[2].as_str() == Some("normal")
+        })
+        .count();
+    assert_eq!(
+        normal, 1,
+        "the `je +0` transfer must be stored exactly once: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|edge| {
+            edge[0].as_u64() == Some(src)
+                && edge[1].as_u64() == Some(dst)
+                && edge[2].as_str() == Some("unwind")
+        }),
+        "the fallthrough transfer is not an unwind edge: {edges:?}"
+    );
+
+    // The whole payload carries no duplicate transfer at all.
+    let mut unique: Vec<(u64, u64, String)> = edges
+        .iter()
+        .map(|edge| {
+            (
+                edge[0].as_u64().expect("from"),
+                edge[1].as_u64().expect("to"),
+                edge[2].as_str().expect("kind").to_string(),
+            )
+        })
+        .collect();
+    let total = unique.len();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        total,
+        unique.len(),
+        "a duplicated transfer must be stored once: {edges:?}"
+    );
+}
+
+#[test]
 fn query_surfaces_are_readable() {
     let project = Project::create();
     expect_success(&project.query(&["decompile", "main", "--update"]));

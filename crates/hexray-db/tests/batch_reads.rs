@@ -9,7 +9,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::*;
-use hexray_core::Instruction;
+use hexray_core::{BasicBlockId, BlockTerminator, Condition, Instruction};
 use hexray_db::address::Address;
 use hexray_db::model::*;
 use hexray_db::store::PayloadBytes;
@@ -1161,5 +1161,73 @@ fn corrupt_scope_payload_is_corrupt_not_a_panic() {
     assert!(
         matches!(error, DbError::Corrupt(_)),
         "expected Corrupt, got {error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge rows are a set
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_cfg_edges_publish_idempotently() {
+    let project = create_project();
+    let mut db = project.open();
+    let first = sequential_instruction(MAIN);
+    let second_address = Address(first.address + first.size as u64);
+    let second = sequential_instruction(second_address);
+    let second_end = Address(second_address.0 + second.size as u64);
+    let instructions = vec![first, second];
+    let mut spec = CfgSpec::simple(main_function(), instructions);
+    // A legal two-block CFG: `je +0` is a conditional branch whose taken and
+    // fallthrough targets are both block 1, so the CFG legitimately holds the
+    // same transfer twice. The store keys edges by (function, from, to, kind),
+    // so the second row must collapse instead of failing the transaction.
+    spec.blocks = vec![
+        block(
+            0,
+            MAIN,
+            second_address,
+            BlockTerminator::ConditionalBranch {
+                condition: Condition::Equal,
+                true_target: BasicBlockId(1),
+                false_target: BasicBlockId(1),
+            },
+        ),
+        block(1, second_address, second_end, BlockTerminator::Return),
+    ];
+    spec.block_instructions = vec![(0, vec![MAIN]), (1, vec![second_address])];
+    spec.edges = vec![(0, 1, EdgeKind::Normal), (0, 1, EdgeKind::Normal)];
+    let generation = unit_generation(&mut db, &UnitKey::function_cfg(ENTRY_A));
+    let revision = db.revision().expect("revision");
+    publish_units(&mut db, revision, vec![spec.into_unit()]);
+    assert_eq!(
+        unit_generation(&mut db, &UnitKey::function_cfg(ENTRY_A)),
+        Some(generation.unwrap_or(0) + 1),
+        "the publish must have committed"
+    );
+    let cfgs = db
+        .snapshot()
+        .expect("snapshot")
+        .cfgs_for_functions(&[ENTRY_A])
+        .expect("cfgs");
+    let cfg = &cfgs[&ENTRY_A];
+    assert_eq!(
+        cfg.blocks.len(),
+        2,
+        "both blocks of the legal CFG are stored"
+    );
+    assert_eq!(
+        cfg.blocks[0].terminator,
+        BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId(1),
+            false_target: BasicBlockId(1),
+        },
+        "block 0 must keep the je +0 shape"
+    );
+    assert_eq!(
+        cfg.edges,
+        vec![(0, 1, EdgeKind::Normal)],
+        "the duplicate transfer collapses into one stored row"
     );
 }

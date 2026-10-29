@@ -2971,8 +2971,13 @@ fn publish_function_cfg(tx: &Transaction<'_>, payload: &FunctionCfgPayload) -> D
     }
 
     {
+        // OR REPLACE, like `block_instructions` and `xrefs`: the edges are a
+        // *set* keyed by (function, from, to, kind). A CFG can legitimately
+        // carry the same transfer twice (a conditional branch whose target is
+        // its fallthrough), and a duplicate row must not abort the whole
+        // publish transaction — it simply describes one edge.
         let mut statement = tx.prepare(
-            "INSERT INTO cfg_edges (image_id, function_address, from_block, to_block, kind)
+            "INSERT OR REPLACE INTO cfg_edges (image_id, function_address, from_block, to_block, kind)
              VALUES (1, ?1, ?2, ?3, ?4)",
         )?;
         for (from, to, kind) in &payload.edges {

@@ -3185,6 +3185,14 @@ fn cfg_payload(analyzed: &crate::analysis_pipeline::AnalyzedFunction) -> Functio
     let mut blocks = Vec::new();
     let mut block_instructions = Vec::new();
     let mut edges = Vec::new();
+    // A CFG may legitimately hold the same normal edge twice: a conditional
+    // branch whose target block is also its fallthrough (e.g. `je` to the very
+    // next instruction) adds `from -> to` twice, because `add_edge` records
+    // every transfer. The store keys edges by (function, from, to, kind), so a
+    // duplicate row is a hard UNIQUE failure for the whole publish batch — and
+    // with it the whole project's analysis. Deduplicate here, keeping first
+    // occurrence order so the stored payload stays deterministic.
+    let mut seen_edges: BTreeSet<(u32, u32, &'static str)> = BTreeSet::new();
     for block_id in analyzed.cfg.block_ids() {
         let Some(block) = analyzed.cfg.block(block_id) else {
             continue;
@@ -3204,10 +3212,14 @@ fn cfg_payload(analyzed: &crate::analysis_pipeline::AnalyzedFunction) -> Functio
                 .collect(),
         ));
         for successor in analyzed.cfg.successors(block_id) {
-            edges.push((block_id.0, successor.0, EdgeKind::Normal));
+            if seen_edges.insert((block_id.0, successor.0, EdgeKind::Normal.as_str())) {
+                edges.push((block_id.0, successor.0, EdgeKind::Normal));
+            }
         }
         for successor in analyzed.cfg.eh_successors(block_id) {
-            edges.push((block_id.0, successor.0, EdgeKind::Unwind));
+            if seen_edges.insert((block_id.0, successor.0, EdgeKind::Unwind.as_str())) {
+                edges.push((block_id.0, successor.0, EdgeKind::Unwind));
+            }
         }
     }
     let xrefs = xrefs_for_function(analyzed.start, &analyzed.instructions, &analyzed.cfg);
@@ -6290,6 +6302,9 @@ mod cache_counters {
 mod tests {
     use super::*;
 
+    use crate::analysis_pipeline::AnalyzedFunction;
+    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph};
+
     #[path = "../../../tests/common/analysis_fixture.rs"]
     mod fixture;
 
@@ -6545,6 +6560,52 @@ mod tests {
             "no window may be decoded twice: {} decodes for {} functions",
             timings.decodes,
             live
+        );
+    }
+
+    #[test]
+    fn cfg_payload_collapses_duplicate_normal_edges() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
+
+        let mut branch = BasicBlock::new(BasicBlockId(0), 0x1000);
+        branch.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId(1),
+            false_target: BasicBlockId(1),
+        };
+        cfg.add_block(branch);
+
+        let mut target = BasicBlock::new(BasicBlockId(1), 0x1002);
+        target.terminator = BlockTerminator::Return;
+        cfg.add_block(target);
+
+        // `je +0`: the branch target is the fallthrough, so `add_edge` records
+        // the same transfer twice. An unwind edge to the same block must still
+        // be stored, because it is a different kind.
+        cfg.add_edge(BasicBlockId(0), BasicBlockId(1));
+        cfg.add_edge(BasicBlockId(0), BasicBlockId(1));
+        cfg.add_eh_edge(BasicBlockId(0), BasicBlockId(1));
+
+        let payload = cfg_payload(&AnalyzedFunction::test_stub(0x1000, Vec::new(), cfg));
+
+        assert_eq!(
+            payload.edges,
+            vec![(0, 1, EdgeKind::Normal), (0, 1, EdgeKind::Unwind)],
+            "the duplicate normal edge is collapsed and the unwind edge is kept"
+        );
+        let branch = payload
+            .blocks
+            .iter()
+            .find(|block| block.id == 0)
+            .expect("block 0 in the payload");
+        assert_eq!(
+            branch.terminator,
+            BlockTerminator::ConditionalBranch {
+                condition: Condition::Equal,
+                true_target: BasicBlockId(1),
+                false_target: BasicBlockId(1),
+            },
+            "edge deduplication must not rewrite the terminator"
         );
     }
 }

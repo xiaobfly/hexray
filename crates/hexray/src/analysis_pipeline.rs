@@ -291,6 +291,26 @@ pub(crate) struct AnalyzedFunction {
     decompiler: Decompiler,
 }
 
+#[cfg(test)]
+impl AnalyzedFunction {
+    /// Test-only constructor: `decompiler` is private, so tests in other
+    /// modules cannot build the struct with a literal.
+    pub(crate) fn test_stub(
+        start: u64,
+        instructions: Vec<Instruction>,
+        cfg: ControlFlowGraph,
+    ) -> Self {
+        Self {
+            start,
+            name: "test".to_string(),
+            instructions,
+            cfg,
+            diagnostics: Vec::new(),
+            decompiler: Decompiler::new(),
+        }
+    }
+}
+
 /// The result of rendering.
 pub(crate) struct RenderedFunction {
     pub text: String,
