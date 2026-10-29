@@ -2743,6 +2743,9 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
             db(database.publish(revision, &AnalysisBatch { units }))?;
             republished_targets.extend(published_now);
             stage.publish_ms += publish_started.elapsed().as_millis();
+            // The batch is stored; its decoded CFGs are only dead weight now
+            // and would otherwise pin every function the command decoded.
+            decode.clear();
         }
     }
     stage.cfg_ms = cfg_started.elapsed().as_millis();

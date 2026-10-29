@@ -541,6 +541,13 @@ impl DecodeSession {
     pub(crate) fn table(&self) -> &HashMap<DecodeKey, Arc<DecodedFunction>> {
         &self.cache
     }
+
+    /// Drop the decoded functions held for this batch. The caller hands the
+    /// table to the workers and then publishes, so nothing needs them again;
+    /// keeping them would pin the whole image outside the memory budget.
+    pub(crate) fn clear(&mut self) {
+        self.cache.clear();
+    }
 }
 
 /// Analyze a function by resolving `request.target` in `binary`.
