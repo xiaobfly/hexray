@@ -519,7 +519,7 @@ fn timings_report_stages_without_changing_the_result() {
     let fixture = Fixture::new(false);
     let database = fixture.create_project("timings.hxdb");
 
-    let output = analyze(&database, &["--force", "--timings", "--json"]);
+    let output = analyze(&database, &["--force", "--timings", "--json", "--jobs", "4"]);
     let stdout = expect_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
     assert!(
@@ -539,5 +539,61 @@ fn timings_report_stages_without_changing_the_result() {
     assert!(
         report["timings"].is_object(),
         "analyze JSON must carry a timings object: {report}"
+    );
+    assert!(
+        report["timings"]["effective_jobs"].as_u64().unwrap_or(0) >= 2,
+        "a forced analysis must use more than one worker: {report}"
+    );
+}
+
+/// Fix A witness: the render stage reuses the analysis pool, so the pool must be
+/// sized from the render targets even when this command has no pending CFG work.
+#[test]
+fn render_after_analyze_uses_the_pool() {
+    let fixture = Fixture::new(false);
+    let database = fixture.create_project("render_pool.hxdb");
+    expect_success(&analyze(&database, &["--force"]));
+
+    let output = analyze(
+        &database,
+        &["--render", "--timings", "--json", "--jobs", "4"],
+    );
+    let stdout = expect_success(&output);
+    let report = parse_json(&stdout, "db analyze --render --json");
+    assert!(
+        report["rendered"].as_u64().unwrap_or(0) > 0,
+        "the render pass must decompile something: {report}"
+    );
+    // Without this the witness is vacuous: leftover analysis batches would size
+    // the pool even if the render targets were ignored.
+    assert_eq!(
+        report["analyzed"].as_u64(),
+        Some(0),
+        "the render-only run must have no pending analysis batches: {report}"
+    );
+    assert!(
+        report["timings"]["effective_jobs"].as_u64().unwrap_or(0) >= 2,
+        "rendering with no pending analysis must still use the pool: {report}"
+    );
+}
+
+/// Fix B witness: a callee published by a later batch must record the same
+/// generation the next run will observe, so the second run analyzes nothing.
+#[test]
+fn multi_batch_analysis_reaches_a_fixed_point() {
+    let fixture = Fixture::new(false);
+    let database = fixture.create_project("fixed_point.hxdb");
+    expect_success(&analyze(
+        &database,
+        &["--force", "--jobs", "1", "--analysis-memory-mib", "64"],
+    ));
+
+    let output = analyze(&database, &["--jobs", "1", "--json"]);
+    let stdout = expect_success(&output);
+    let report = parse_json(&stdout, "db analyze --json");
+    assert_eq!(
+        report["analyzed"].as_u64(),
+        Some(0),
+        "a second run must find every unit current: {report}"
     );
 }

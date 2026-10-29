@@ -2519,12 +2519,20 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
     // The pool is sized by what the batches can actually use: never more
     // workers than a batch has functions, and never more than the working-set
     // budget covers at the per-function floor.
-    let effective_jobs = batches
+    let analysis_jobs = batches
         .iter()
         .map(|batch| request.exec.effective_jobs(batch.len()))
         .max()
         .unwrap_or(1)
         .min(requested_jobs);
+    let effective_jobs = if request.render.is_some() {
+        // The render stage reuses this pool, and its pending set is empty in the
+        // common "analyze, then --render" flow: size it from the render targets
+        // too, or all decompilation runs on the CLI thread.
+        analysis_jobs.max(request.exec.effective_jobs(targets.len().max(1)))
+    } else {
+        analysis_jobs
+    };
     let pool = if effective_jobs > 1 {
         Some(build_worker_pool(effective_jobs)?)
     } else {
@@ -2533,6 +2541,10 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    let batched: BTreeSet<Address> = batches.iter().flatten().copied().collect();
+    // Owners already republished by an earlier batch: their generation is one
+    // ahead of the command-start snapshot.
+    let mut republished_targets: BTreeSet<Address> = BTreeSet::new();
     let cfg_started = std::time::Instant::now();
     for batch in &batches {
         // A batch reads the generations it will compare against from the same
@@ -2675,11 +2687,15 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
                         target,
                     ))))?
                     .unwrap_or(0);
-                    // Published in this batch? Then it lands at current + 1.
-                    let republished = generations
-                        .get(&Address(target))
-                        .is_some_and(|expected| expected.unwrap_or(0) == current);
-                    generations_now.insert(target, if republished { current + 1 } else { current });
+                    let target_address = Address(target);
+                    // A target that this command will (re)publish — now or in a
+                    // later batch — ends the command at current + 1. Using the
+                    // snapshot value would make the next run recompute this
+                    // caller.
+                    let bumps = generations.contains_key(&target_address)
+                        || (batched.contains(&target_address)
+                            && !republished_targets.contains(&target_address));
+                    generations_now.insert(target, if bumps { current + 1 } else { current });
                 }
             }
             generations_now
@@ -2719,9 +2735,13 @@ fn run_analysis(database: &mut Database, request: &AnalyzeRequest) -> Result<Ana
         }
         if !units.is_empty() {
             let publish_started = std::time::Instant::now();
+            // What this batch republishes decides the +1 bump for callees in
+            // later batches, so take the addresses before the batch is moved.
+            let published_now: Vec<Address> = units.iter().map(|unit| unit.key.key).collect();
             // A whole batch in one transaction: the orphan-instruction sweep
             // then runs once per batch, after every owner in it was replaced.
             db(database.publish(revision, &AnalysisBatch { units }))?;
+            republished_targets.extend(published_now);
             stage.publish_ms += publish_started.elapsed().as_millis();
         }
     }
